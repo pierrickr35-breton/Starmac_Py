@@ -127,6 +127,7 @@ def _sample_header_block(sp: dict, site: str = "n.d") -> str:
         f"specimen: {name}\tsample: {name}\tsite: {site}\t"
         f"volume: {_nd(sp.get('volume'), '.2f')}\tmass: n.d\t"
         f"lat: {_nd(lat, '.5f')}\tlon: {_nd(lon, '.5f')}\televation: n.d\t"
+        f"stratigraphic_height: n.d\t"
         f"comment: n.d"
     )
     # azimuth/dip : convention Utrecht -> Starmac donnee par l'utilisateur

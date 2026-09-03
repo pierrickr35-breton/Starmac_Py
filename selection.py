@@ -12,7 +12,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, TextIO
+from typing import Dict, List, Optional, TextIO, Tuple
 
 from testlect import Measurement, Pmag
 from orient_sample import compute_local_declination
@@ -54,6 +54,9 @@ class SelectedSample:
     magic_li: str = ""
     magic_loc: str = ""
     magic_obs: str = ""
+    # Position stratigraphique (metres, positif vers le haut) - voir
+    # testlect.Pmag.stratigraphic_height ; None si non renseignee.
+    stratigraphic_height: Optional[float] = None
     mesures: List[Measurement] = field(default_factory=list)
 
 
@@ -193,10 +196,20 @@ def apply_orientation(x: float, y: float, z: float, ech: "SelectedSample", orien
 
 
 def _mag_values(ech: "SelectedSample", mtot: float) -> tuple:
-    """(A/m, Am2/kg) : l'un des deux est None selon ech.norme ('v' ou 'm')."""
+    """(A/m, Am2/kg) : l'un des deux est None selon ech.norme ('v' ou 'm').
+    Les DEUX sont None si `ech.vol` est manquant (0/None) - ni normalisable
+    en A/m ni en Am2/kg sans volume/masse - demande explicite utilisateur
+    ("when the volume or the mass of the sample is not given, best to show
+    the data in total moment as done in the list") : le Fortran d'origine
+    divisait TOUJOURS par ech.vol sans le verifier. Affiche desormais "--"
+    (voir _fmt_mag) plutot qu'un faux "0.0" - la colonne "Mtot Am2" (deja
+    calculee independamment du volume par l'appelant, ex. list_measurements)
+    reste la seule valeur fiable dans ce cas."""
+    if not ech.vol:
+        return None, None
     if ech.norme == "m":
-        return None, (mtot * 1.0e3 / ech.vol if ech.vol else 0.0)
-    return (mtot * 1.0e6 / ech.vol if ech.vol else 0.0), None
+        return None, mtot * 1.0e3 / ech.vol
+    return mtot * 1.0e6 / ech.vol, None
 
 
 def _s_value(ech: "SelectedSample", m: Measurement) -> float:
@@ -207,6 +220,27 @@ def _s_value(ech: "SelectedSample", m: Measurement) -> float:
 
 def _fmt_mag(value: Optional[float]) -> str:
     return f"{value:10.3E}" if value is not None else "   --     "
+
+
+def normalized_intensity(ech: "SelectedSample", raw_magnitude: float) -> Tuple[float, str]:
+    """(valeur, unite) - normalise `raw_magnitude` (Am2, deja la norme
+    d'un vecteur brut) par le volume/masse de `ech`, comme partout
+    ailleurs (facteur 1e6 pour un volume -> A/m, 1e3 pour une masse ->
+    Am2/kg). Si `ech.vol` est manquant (0/None), retourne `raw_magnitude`
+    INCHANGE avec l'unite "Am2" (moment total brut, PAS de facteur
+    applique) - demande explicite utilisateur ("when the volume or the
+    mass of the sample is not given, best to show the data in total
+    moment as done in the list... the previous Fortran was systematically
+    dividing by mass and volume and was not expecting no vol and no
+    mass") : le Fortran d'origine appliquait quand meme le facteur 1e3/
+    1e6 a un volume/masse absent (repli implicite sur 1.0), affichant une
+    valeur sans rapport avec l'unite revendiquee plutot que le moment
+    total honnete - meme principe que zijderveld._scale_factor."""
+    if not ech.vol:
+        return raw_magnitude, "Am2"
+    if ech.norme == "m":
+        return raw_magnitude * 1.0e3 / ech.vol, "Am2/kg"
+    return raw_magnitude * 1.0e6 / ech.vol, "A/m"
 
 
 def _parse_heuremes(s: Optional[str]) -> Optional[datetime]:
@@ -257,6 +291,7 @@ def _build_selected_sample(p: Pmag, matched_mesures: List[Measurement]) -> Selec
         magic_li=p.magic_li,
         magic_loc=p.magic_loc,
         magic_obs=p.magic_obs,
+        stratigraphic_height=p.stratigraphic_height,
         mesures=matched_mesures,
     )
 
@@ -599,12 +634,18 @@ def list_xyz(
 
     ij = 1
     for ech in selected:
-        factor = 1.0e3 if ech.norme == "m" else 1.0e6
+        # Pas de facteur 1e3/1e6 sans volume/masse (0/None) - affiche les
+        # composantes brutes (Am2) inchangees plutot qu'un faux "0.0" -
+        # demande explicite utilisateur ("when the volume or the mass of
+        # the sample is not given, best to show the data in total moment
+        # as done in the list"), meme principe que normalized_intensity.
+        factor = (1.0e3 if ech.norme == "m" else 1.0e6) if ech.vol else 1.0
+        vol = ech.vol or 1.0
         for m in ech.mesures:
             xx, yy, zz = apply_orientation(m.x, m.y, m.z, ech, orientation)
-            rxx = xx * factor / ech.vol if ech.vol else 0.0
-            ryy = yy * factor / ech.vol if ech.vol else 0.0
-            rzz = zz * factor / ech.vol if ech.vol else 0.0
+            rxx = xx * factor / vol
+            ryy = yy * factor / vol
+            rzz = zz * factor / vol
             s_conv = _s_value(ech, m)
 
             out.write(
@@ -707,13 +748,16 @@ def diff_measurements(
 
     ij = 1
     for ech in selected:
-        factor = 1.0e3 if ech.norme == "m" else 1.0e6
         for j in range(len(ech.mesures) - 1):
             a, b = ech.mesures[j], ech.mesures[j + 1]
             dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
             xx, yy, zz = apply_orientation(dx, dy, dz, ech, orientation)
             mtot, dec, inc = polere(xx, yy, zz)
-            mtot = mtot * factor / ech.vol if ech.vol else 0.0
+            # sans volume/masse (0/None) : moment total brut (Am2), pas un
+            # faux "0.0" - demande explicite utilisateur ("when the volume
+            # or the mass of the sample is not given, best to show the
+            # data in total moment as done in the list").
+            mtot, _unit = normalized_intensity(ech, mtot)
 
             out.write(
                 f"{ij:4d}: {ech.id:<12s}  {a.etape:4d}{a.cod1}{a.cod2}  "

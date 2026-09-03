@@ -149,6 +149,7 @@ def _sample_header_block(p: Pmag) -> str:
         f"specimen: {p.id}\tsample: {sample}\tsite: {site}\t"
         f"volume: {_nd(volume, '.2f')}\tmass: {_nd(mass, '.2f')}\t"
         f"lat: {p.lat:.5f}\tlon: {p.rlong:.5f}\televation: {p.altitude:.1f}\t"
+        f"stratigraphic_height: {_nd(p.stratigraphic_height, '.2f')}\t"
         f"comment: {p.com.strip() or 'n.d'}"
     )
     line_b = (
@@ -264,13 +265,14 @@ def convert_sample(p: Pmag) -> str:
 def convert_file(
     path_in: str, path_out: str,
     legacy_results_path: Optional[str] = None,
-) -> Tuple[int, int]:
+) -> Tuple[int, int, List[str]]:
     """Retourne (nb echantillons convertis, nb resultats convertis depuis
-    un ANCIEN fichier .r compagnon - 0 si aucun n'existe). Le fichier .r
-    (positions de colonnes fixes) est converti vers .pmagres a cote de
-    `path_out` si trouve - demande explicite utilisateur ("during the
-    convert legacy file to the new format, is it possible to convert the
-    .r file with the results").
+    un ANCIEN fichier .r compagnon - 0 si aucun n'existe, avertissements
+    de renumerotation - voir calcul.convert_legacy_results_file). Le
+    fichier .r (positions de colonnes fixes) est converti vers .pmagres a
+    cote de `path_out` si trouve - demande explicite utilisateur ("during
+    the convert legacy file to the new format, is it possible to convert
+    the .r file with the results").
 
     `legacy_results_path` est OPTIONNEL : par defaut, meme base que
     `path_in` (.ren -> .r), ce qui suppose que le .r legacy est a cote du
@@ -304,8 +306,8 @@ def convert_file(
 
     old_results_path = legacy_results_path or (os.path.splitext(path_in)[0] + ".r")
     new_results_path = results_path_for(path_out)
-    n_results = convert_legacy_results_file(old_results_path, new_results_path)
-    return len(samples), n_results
+    n_results, warnings = convert_legacy_results_file(old_results_path, new_results_path)
+    return len(samples), n_results, warnings
 
 
 if __name__ == "__main__":
@@ -314,7 +316,9 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output")
     args = parser.parse_args()
     out = args.output or os.path.splitext(args.ren_file)[0] + ".prmag"
-    n, n_results = convert_file(args.ren_file, out)
+    n, n_results, warnings = convert_file(args.ren_file, out)
     print(f"{n} sample(s) converted -> {out}")
     if n_results:
         print(f"{n_results} result(s) converted -> {results_path_for(out)}")
+    for w in warnings:
+        print(f"WARNING: {w}")

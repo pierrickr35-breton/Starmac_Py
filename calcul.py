@@ -9,13 +9,15 @@ Travaille sur les SelectedSample/Measurement de selection.py.
 
 import math
 import os
-import random
+import string
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from selection import Measurement, SelectedSample, apply_orientation, polere, select_samples
+from selection import (
+    Measurement, SelectedSample, apply_orientation, polere, select_samples, normalized_intensity,
+)
 from testlect import Pmag
 
 
@@ -27,7 +29,11 @@ from testlect import Pmag
 @dataclass
 class FitResult:
     """Un ajustement de droite (equivalent d'un enregistrement `res`/`tr`)."""
-    c: int = 0              # identifiant anti-collision (equivalent res.c), rempli a l'archivage
+    # identifiant anti-collision (equivalent res.c), rempli a l'archivage -
+    # "<specimen>_<lettre>" (voir _next_specimen_c), PAS un entier aleatoire
+    # 0-99999 (l'ancien schema, remplace suite a un fichier legacy reel
+    # corrompu - voir _next_specimen_c pour le detail).
+    c: str = ""
     id: str = ""
     cin: float = 0.0
     caz: float = 0.0
@@ -38,6 +44,20 @@ class FitResult:
     orig: str = "n"        # 'o' = ancre a l'origine, 'n' = non ancre
     demag: str = ""
     numcomp: int = 1
+    # Etiquette de COMPOSANTE de magnetisation (A/B/C...) - PAS dans le
+    # Fortran, demande explicite utilisateur ("when there is different
+    # components of magnetizations within the same site, we may have two
+    # or three means by site... We need to add a column component A,B,C").
+    # Distinct de `numcomp` (numero d'ajustement PCA 1-9, deja existant) :
+    # `numcomp` designe QUEL segment de mesures a ete ajuste sur un
+    # specimen donne, `component` designe la nature physique du signal
+    # retenu (ex. surimpression basse temperature vs ChRM haute
+    # temperature) - assigne explicitement, jamais derive de `numcomp`
+    # ("I think it is best not to use the numcomp of individual samples
+    # for the mean"). Meme concept que sites.dir_comp_name/
+    # specimens.dir_comp du modele MagIC (verifie live). Defaut "A" (la
+    # composante principale/unique quand un seul jeu existe par site).
+    component: str = "A"
     nb: int = 0
     dec: float = 0.0       # declinaison/inclinaison BRUTES (repere echantillon,
     inc: float = 0.0       # non corrigees - comme res.dec/res.inc en Fortran)
@@ -63,6 +83,29 @@ class FitResult:
     par3_mean: float = 0.0
     par4: float = 0.0
     par5: float = 0.0
+    # Ovale de confiance du VGP (demi-axes, degres) - voir dp_dm_from_a95.
+    # Uniquement pour un "mean:" (comme par4/par5 juste au-dessus).
+    vgp_dp: float = 0.0
+    vgp_dm: float = 0.0
+    # Nombre de resultats ligne/plan combines dans la moyenne - PAS dans le
+    # Fortran (qui stockait un compte equivalent directement dans tr(i).
+    # tx(1)/tx(2), repurpose ici pour k - voir _format_mean_line), calcule
+    # jusqu'ici seulement A L'AFFICHAGE par recoupement fragile de `liste`
+    # contre les resultats actuellement charges (list_results/
+    # _mean_line_plane_counts - "?" si les specimens ne sont pas dans la
+    # selection courante). Demande explicite utilisateur ("add a column
+    # l/p with the number of lines and planes used in the mean Fisher for
+    # the site... useful in the table for the publication") : desormais
+    # PERSISTE avec la moyenne des l'archivage (voir
+    # build_site_mean_result), fiable independamment de ce qui est charge
+    # au moment de l'affichage. -1 = non renseigne (colonne reservee mais
+    # pas peuplee - moyennes importees d'un autre format, ex. MagIC :
+    # "This column will only be populated from now on. But during import
+    # of other files keep the place for this column" - jamais deduit
+    # apres coup pour ces imports, meme si l'information serait
+    # techniquement calculable).
+    n_lines: int = -1
+    n_planes: int = -1
     liste: str = ""
 
 
@@ -76,6 +119,10 @@ class FisherStats:
     k: float
     a95: float
     csd: float
+    # Nombre de directions inversees par combine_antipodal_groups avant le
+    # calcul (0 si l'option n'a pas ete demandee, ou si un seul mode a ete
+    # detecte - rien a inverser).
+    n_flipped: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -301,38 +348,237 @@ def fisher_mean(directions: List[Tuple[float, float]]) -> FisherStats:
     return FisherStats(n=n, dec=mean_dec, inc=mean_inc, r=r, k=k, a95=a95, csd=csd)
 
 
-def fisher_from_measurements(selected: List[SelectedSample], orientation: int = 1) -> FisherStats:
+def combine_antipodal_groups(
+    directions: List[Tuple[float, float]],
+) -> Tuple[List[Tuple[float, float]], int]:
+    """Detecte deux groupes de directions quasi-antipodaux (typiquement les
+    intervalles de polarite normale/inverse d'une courte section
+    magnetostratigraphique) et inverse (dec+180, -inc) le groupe le MOINS
+    nombreux, pour permettre le calcul d'une seule moyenne de Fisher
+    combinee - demande explicite utilisateur ("when in the results there
+    are two nearly antipodal groups, best to invert the group with less
+    results. This is the case in a short magnetostratigraphic section").
+
+    Meme principe que `pmag.flip` (pmagpy, code disponible dans
+    StereoUtils_Py) : l'axe de reference est le vecteur propre dominant de
+    la matrice d'orientation (bidirectionnelle - construite a partir de
+    x.x^T, donc insensible a la polarite de chaque direction). Un jeu de
+    directions unimodal (un seul mode) donne un axe proche de sa propre
+    direction moyenne : toutes les directions tombent alors du meme cote
+    (angle <= 90 deg) et rien n'est inverse, ce qui evite de retourner par
+    erreur un simple point isole/aberrant d'un jeu par ailleurs unimodal.
+
+    Retourne (directions ajustees, nombre de directions inversees) - la
+    liste d'entree n'est jamais modifiee en place."""
+    n = len(directions)
+    if n < 2:
+        return list(directions), 0
+
+    vecs = np.array([
+        (
+            math.cos(math.radians(inc)) * math.cos(math.radians(dec)),
+            math.cos(math.radians(inc)) * math.sin(math.radians(dec)),
+            math.sin(math.radians(inc)),
+        )
+        for dec, inc in directions
+    ])
+    orient = vecs.T @ vecs
+    eigvals, eigvecs = np.linalg.eigh(orient)
+    axis = eigvecs[:, int(np.argmax(eigvals))]
+
+    angles = np.degrees(np.arccos(np.clip(vecs @ axis, -1.0, 1.0)))
+    group_a = [k for k in range(n) if angles[k] <= 90.0]
+    group_b = [k for k in range(n) if angles[k] > 90.0]
+    if not group_a or not group_b:
+        return list(directions), 0
+
+    minority = group_b if len(group_b) <= len(group_a) else group_a
+    adjusted = list(directions)
+    for k in minority:
+        dec, inc = adjusted[k]
+        adjusted[k] = ((dec + 180.0) % 360.0, -inc)
+    return adjusted, len(minority)
+
+
+# cat1 traites comme des LIGNES par `fishres` (calcul.f:84-142, meme
+# regroupement pour 'L','f' ET 's' - seul 'P' est traite a part comme un
+# pole de grand cercle) - voir fisher_from_results/fisher_combine_lines_planes.
+_LINE_LIKE_CAT1 = ("L", "f", "s")
+
+
+def fisher_combine_lines_planes(
+    lines: List[Tuple[float, float]], planes: List[Tuple[float, float]],
+) -> FisherStats:
+    """Port de `fishgc` (calcul.f:169-515, verifie contre le source Fortran
+    - demande explicite utilisateur "check the fortran") : moyenne de
+    Fisher combinant des directions de ligne (`lines`) et des poles de
+    grand cercle (`planes`, ex. le pole retourne par `fit_plane`) selon
+    McFadden & McElhinny (EPSL, 1988, v87) - message imprime par le
+    Fortran lui-meme ("Mean direction following McFadden et McElhinny...
+    combining great circles and directions"). Chaque plan est
+    iterativement reprojete sur son grand cercle, au point le plus proche
+    de la moyenne courante (Gauss-Seidel : le point du plan en cours de
+    mise a jour est d'abord RETIRE de la somme courante avant d'etre
+    recalcule, puis rajoute - meme sequence que le Fortran, PAS une simple
+    recomputation en parallele), jusqu'a 100 iterations ou convergence
+    (`r1 < r0*(1+1e-6)` apres au moins 16 iterations - memes constantes
+    que le Fortran).
+
+    Fonctionnalite "secteur" du Fortran (restreindre la reprojection a un
+    ARC plutot qu'au grand cercle complet, via ad1/ai1/ad2/ai2) : PAS
+    portee - entierement DESACTIVEE dans le source lui-meme (`iyes='n'`
+    code en dur, toute la saisie/logique de secteur est en commentaires)
+    - code mort, jamais atteignable meme en Fortran.
+
+    `csd` n'est pas calcule par `fishgc` dans ce cas combine (contrairement
+    a `fisher_mean` seule) - retourne toujours 0.0 ici. Si `planes` est
+    vide, les formules k/a95 de McFadden&McElhinny se reduisent
+    algebriquement a celles de Fisher standard (verifie) - mais cette
+    fonction ne prend PAS ce raccourci elle-meme, c'est a l'appelant de
+    preferer `fisher_mean` directement dans ce cas (voir
+    fisher_from_results) pour eviter 100 iterations pour rien."""
+    m, imm = len(lines), len(planes)
+    if m + imm < 2:
+        raise ValueError("need at least 2 combined line/plane results for a Fisher mean")
+
+    def _unit(dec: float, inc: float) -> Tuple[float, float, float]:
+        decr, incr = math.radians(dec), math.radians(inc)
+        return math.cos(incr) * math.cos(decr), math.cos(incr) * math.sin(decr), math.sin(incr)
+
+    def _project(u0: float, v0: float, w0: float, pqr: Tuple[float, float, float]):
+        p, q, r = pqr
+        tau = u0 * p + v0 * q + w0 * r
+        # garde anti-crash (PAS dans le Fortran, ou une division IEEE par 0
+        # produirait Inf plutot qu'une exception Python) - n'affecte que le
+        # cas degenere ou la moyenne courante coincide EXACTEMENT avec le
+        # pole d'un plan (mathematiquement indefini : tout point du grand
+        # cercle est alors equidistant).
+        ro = math.sqrt(max(1e-12, 1.0 - tau * tau))
+        return (u0 - tau * p) / ro, (v0 - tau * q) / ro, (w0 - tau * r) / ro
+
+    sx = sy = sz = 0.0
+    if m == 0:
+        # Fortran : demande une direction de depart (defaut (0,0) si
+        # l'utilisateur ne saisit rien) quand aucune ligne n'est disponible -
+        # equivalent headless : toujours le defaut (0,0).
+        u0, v0, w0 = 1.0, 0.0, 0.0
+    else:
+        for dec, inc in lines:
+            x, y, z = _unit(dec, inc)
+            sx += x; sy += y; sz += z
+        norm = math.sqrt(sx * sx + sy * sy + sz * sz)
+        u0, v0, w0 = sx / norm, sy / norm, sz / norm
+
+    pqr_list = [_unit(dec, inc) for dec, inc in planes]
+    xg = [0.0] * imm
+    yg = [0.0] * imm
+    zg = [0.0] * imm
+
+    for i in range(imm):
+        xg[i], yg[i], zg[i] = _project(u0, v0, w0, pqr_list[i])
+        sx += xg[i]; sy += yg[i]; sz += zg[i]
+        norm = math.sqrt(sx * sx + sy * sy + sz * sz)
+        u0, v0, w0 = sx / norm, sy / norm, sz / norm
+    r0 = math.sqrt(sx * sx + sy * sy + sz * sz)
+
+    r1 = r0
+    for itr in range(1, 101):
+        for j in range(imm):
+            sx -= xg[j]; sy -= yg[j]; sz -= zg[j]
+            norm = math.sqrt(sx * sx + sy * sy + sz * sz)
+            u0, v0, w0 = sx / norm, sy / norm, sz / norm
+            xg[j], yg[j], zg[j] = _project(u0, v0, w0, pqr_list[j])
+            sx += xg[j]; sy += yg[j]; sz += zg[j]
+            norm = math.sqrt(sx * sx + sy * sy + sz * sz)
+            u0, v0, w0 = sx / norm, sy / norm, sz / norm
+        r1 = math.sqrt(sx * sx + sy * sy + sz * sz)
+        if r1 < r0 * (1.0 + 1e-6) and itr > 15:
+            break
+        r0 = r1
+
+    _, dec, inc = polere(sx, sy, sz)
+    # Cas structurellement 0/0 (m==0 et imm==2 : deux grands cercles SANS
+    # ligne convergent generiquement sur un unique point d'intersection
+    # exact, r1==2==m+imm) : le Fortran (IEEE) obtiendrait NaN silencieusement,
+    # Python leve ZeroDivisionError sur une division flottante par 0 - meme
+    # resultat (NaN) obtenu ici explicitement plutot que de planter.
+    denom = 2 * (m + imm - r1)
+    rk = (2 * m + imm - 2) / denom if abs(denom) > 1e-12 else float("nan")
+    # nprim = m + imm/2 (division ENTIERE, comme en Fortran - chaque plan
+    # compte pour une demi-donnee dans le calcul des degres de liberte).
+    nprim = m + imm // 2
+    if nprim <= 1:
+        # Fortran : `1/(float(nprim)-1)` -> IEEE Inf, `(nprim-1)*Inf` -> NaN
+        # (nprim-1 vaut 0 comme entier), NaN se propage jusqu'au test
+        # `abs(alpha95)<1.0` (toujours FAUX pour NaN) -> alpha95=90.0. Meme
+        # resultat obtenu ici explicitement (Python leve ZeroDivisionError
+        # sur une division flottante par 0, contrairement au Fortran/IEEE).
+        alpha95 = 90.0
+    else:
+        fac = 1.0 / (nprim - 1)
+        p_ = 20 ** fac - 1
+        a = 1 - (nprim - 1) * p_ / (rk * r1)
+        alpha95 = math.degrees(math.acos(a)) if abs(a) < 1.0 else 90.0
+
+    return FisherStats(n=m + imm, dec=dec, inc=inc, r=r1, k=rk, a95=alpha95, csd=0.0)
+
+
+def fisher_from_measurements(
+    selected: List[SelectedSample], orientation: int = 1, combine_antipodal: bool = False,
+) -> FisherStats:
     """Equivalent de `fishmes` : moyenne de Fisher calculee directement sur
     TOUTES les mesures de la selection (chaque etape de demagnetisation
-    compte comme une direction independante), apres correction d'orientation."""
+    compte comme une direction independante), apres correction d'orientation.
+    `combine_antipodal` : voir combine_antipodal_groups (option, defaut
+    False - ne change pas le comportement existant par defaut)."""
     directions = []
     for ech in selected:
         for m in ech.mesures:
             xx, yy, zz = apply_orientation(m.x, m.y, m.z, ech, orientation)
             _, dec, inc = polere(xx, yy, zz)
             directions.append((dec, inc))
-    return fisher_mean(directions)
+    n_flipped = 0
+    if combine_antipodal:
+        directions, n_flipped = combine_antipodal_groups(directions)
+    stats = fisher_mean(directions)
+    return replace(stats, n_flipped=n_flipped)
 
 
-def fisher_from_results(results: List[FitResult], orientation: int = 1) -> FisherStats:
-    """Equivalent (partiel) de `fishres` : moyenne de Fisher sur les
-    ajustements de droite (cat1='L'), en reappliquant la correction
-    d'orientation de chaque resultat (son propre cin/caz/dip/str). Les
-    ajustements de plan (cat1='P', resolus par intersection de grands
-    cercles dans le Fortran via `fishgc`) ne sont pas geres ici."""
-    directions = []
+def fisher_from_results(
+    results: List[FitResult], orientation: int = 1, combine_antipodal: bool = False,
+) -> FisherStats:
+    """Equivalent de `fishres`+`fishgc` (calcul.f) - demande explicite
+    utilisateur ("when lines and planes are selected for a fisher result,
+    use the combined L & P", verifiee contre le source Fortran : "check
+    the fortran"). Sur les resultats de type ligne (cat1 in 'L'/'f'/'s' -
+    meme regroupement que `fishres`, calcul.f:84-142 - PAS uniquement
+    'L') ET de type plan (cat1=='P', combines via McFadden & McElhinny -
+    voir fisher_combine_lines_planes), en reappliquant la correction
+    d'orientation de chaque resultat (son propre cin/caz/dip/str, via
+    `_correct_dec_inc` - la meme transformation que le Fortran applique
+    UNIFORMEMENT a tr(j) avant de classer en ligne/plan). Auparavant
+    limitee aux seuls resultats 'L' - les plans (et 'f'/'s') etaient
+    silencieusement ignores.
+
+    `combine_antipodal` : voir combine_antipodal_groups (option, defaut
+    False) - applique UNIQUEMENT aux directions de type ligne (un pole de
+    grand cercle n'a pas de "polarite" a inverser)."""
+    lines: List[Tuple[float, float]] = []
+    planes: List[Tuple[float, float]] = []
     for res in results:
-        if res.cat1 != "L":
-            continue
-        zz = math.sin(math.radians(res.inc))
-        xx = math.cos(math.radians(res.inc)) * math.cos(math.radians(res.dec))
-        yy = math.cos(math.radians(res.inc)) * math.sin(math.radians(res.dec))
-        xx, yy, zz = apply_orientation(xx, yy, zz, res, orientation)
-        _, dec, inc = polere(xx, yy, zz)
-        directions.append((dec, inc))
-    if not directions:
-        raise ValueError("no line-type result ('L') in the list")
-    return fisher_mean(directions)
+        if res.cat1 in _LINE_LIKE_CAT1:
+            lines.append(_correct_dec_inc(res, orientation))
+        elif res.cat1 == "P":
+            planes.append(_correct_dec_inc(res, orientation))
+    if not lines and not planes:
+        raise ValueError("no line or plane result ('L'/'P'/'f'/'s') in the list")
+
+    n_flipped = 0
+    if combine_antipodal and lines:
+        lines, n_flipped = combine_antipodal_groups(lines)
+
+    stats = fisher_mean(lines) if not planes else fisher_combine_lines_planes(lines, planes)
+    return replace(stats, n_flipped=n_flipped)
 
 
 # ---------------------------------------------------------------------------
@@ -628,18 +874,133 @@ _ORIENT_HEADER = {
 _ORIENT_MODE_TAG = {1: "Sa", 2: "IS", 3: "TC"}
 
 
+def dp_dm_from_a95(a95: float, inc: float) -> Tuple[float, float]:
+    """dP,dM (demi-axes, en degres, de l'ovale de confiance du VGP derive
+    d'une direction moyenne + a95) - dP le long du grand cercle site-pole,
+    dM perpendiculaire. Meme formule que StereoUtils_Py
+    (`stereo_pmagutils._dp_dm_dir_to_vgp`, elle-meme portee de
+    pmagoutils.f:1758-1761, VGPC1/VGPC3) et que `_e95` ci-dessous (qui n'en
+    prenait que la moyenne pour l'affichage `lisres`) - exposee separement
+    pour l'archivage .pmagres (demande explicite utilisateur : "during the
+    archive of the mean direction in pmagres, the VGP is calculated. Is it
+    possible to add the dp dm ellipse of confidence derived from the a95,
+    available in Stereo_Py"). Verifiee contre une VRAIE contribution MagIC
+    publiant deja vgp_dp/vgp_dm (magic_contribution_20340.txt, site "AynC" :
+    a95=6.4, inc=27.3 -> dp=3.8/dm=7.0 publies, dp=3.80/dm=6.97 calcules
+    ici). `inc` est l'inclinaison de la DIRECTION moyenne (repere site),
+    pas celle du VGP lui-meme."""
+    if a95 <= 0:
+        return 0.0, 0.0
+    ai = math.radians(inc)
+    pl = 1.57095 - math.atan(0.5 * math.tan(ai))
+    dm = a95 * math.sin(pl) / math.cos(ai)
+    dp = 2 * a95 * (1 / (1 + 3 * math.cos(ai) ** 2))
+    return dp, dm
+
+
 def _e95(a95: float, inc: float) -> float:
     """Equivalent exact de la formule e95 de `lisres` (dataselect.f, juste
     avant le format 201) : deduite de a95 et de l'inclinaison de la
     moyenne (paleolatitude via VGP), PAS d'une donnee stockee - calculable
     a l'affichage, comme dans le Fortran."""
-    if a95 <= 0:
-        return 0.0
-    ai = math.radians(inc)
-    pl = 1.57095 - math.atan(0.5 * math.tan(ai))
-    dm = a95 * math.sin(pl) / math.cos(ai)
-    dp = 2 * a95 * (1 / (1 + 3 * math.cos(ai) ** 2))
+    dp, dm = dp_dm_from_a95(a95, inc)
     return (dm + dp) / 2
+
+
+def dir_to_vgp(dec: float, inc: float, site_lat: float, site_lon: float) -> Tuple[float, float]:
+    """Direction (dec, inc) mesuree au site (site_lat, site_lon) -> pole VGP
+    (vgp_lat, vgp_lon), tout en degres. Meme formule que StereoUtils_Py
+    (`stereo_pmagutils.dodi_vgp`, portee de `pmagoutils.f:4001-4074`) -
+    demande explicite utilisateur ("in fisher results, a mean is
+    calculated for the site, if the user want to archive this mean, this
+    mean needs to be recorded in the .pmagres file") : jusqu'ici seul
+    l'import MagIC archivait un VGP (deja calcule par la contribution
+    source, jamais recalcule ici - voir convert_magic_to_r), Starmac_Py
+    n'avait pas sa propre transformation direction->VGP."""
+    dec_r, inc_r = math.radians(dec), math.radians(inc)
+    slat_r, slon_r = math.radians(site_lat), math.radians(site_lon)
+    p = math.atan2(2.0, math.tan(inc_r))
+    plat = math.asin(
+        math.sin(slat_r) * math.cos(p) + math.cos(slat_r) * math.sin(p) * math.cos(dec_r)
+    )
+    cos_plat = math.cos(plat)
+    beta = (math.sin(p) * math.sin(dec_r)) / cos_plat if cos_plat else 0.0
+    beta = math.asin(max(-1.0, min(1.0, beta)))
+    if math.cos(p) >= math.sin(slat_r) * math.sin(plat):
+        plon = slon_r + beta
+    else:
+        plon = slon_r + math.pi - beta
+    plon %= 2.0 * math.pi
+    return math.degrees(plat), math.degrees(plon)
+
+
+def site_lat_lon_from_donnees(site: str, donnees) -> Optional[Tuple[float, float]]:
+    """Latitude/longitude du site, lues sur N'IMPORTE QUEL specimen de
+    `donnees` dont l'id commence par `site` (meme principe que
+    _mean_site_strike_dip - une propriete de site, identique pour tous ses
+    specimens). Retourne None si `donnees` n'est pas fourni ou si aucun
+    specimen du site n'y est trouve."""
+    if not donnees:
+        return None
+    ech = next((s for s in donnees if s.id.startswith(site)), None)
+    if ech is None:
+        return None
+    return ech.lat, ech.rlong
+
+
+def build_site_mean_result(
+    stats: FisherStats,
+    contributing: List[FitResult],
+    site: str,
+    orientation: int,
+    site_lat: float = 0.0,
+    site_lon: float = 0.0,
+    component: str = "A",
+) -> FitResult:
+    """Construit un resultat "mean:" (moyenne de site) archivable, a partir
+    des statistiques de Fisher (fisher_from_results) et des resultats
+    individuels qui y contribuent - demande explicite utilisateur ("in
+    fisher results, a mean is calculated for the site, if the user want to
+    archive this mean, this mean needs to be recorded in the .pmagres
+    file"). Jusqu'ici, seul l'import MagIC (convert_magic_to_r) produisait
+    des lignes "mean:" ; aucune fonction n'existait pour archiver une
+    moyenne calculee localement par l'application elle-meme.
+
+    `site_lat`/`site_lon` : necessaires au calcul du VGP (dir_to_vgp) -
+    0.0/0.0 si non disponibles (voir site_lat_lon_from_donnees), le VGP est
+    alors archive mais denue de sens (0,0 n'est jamais un vrai site) -
+    laisse a l'appelant le soin de prevenir l'utilisateur plutot que de
+    bloquer l'archivage. `component` : etiquette de composante de
+    magnetisation (A/B/C..., voir FitResult.component) - demandee
+    explicitement a l'archivage, jamais deduite de `numcomp` des resultats
+    individuels ("I think it is best not to use the numcomp of individual
+    samples for the mean").
+
+    n_lines/n_planes (colonne "L/P" du .pmagres) : comptes des resultats de
+    `contributing` par type - cat1 in 'L'/'f'/'s' pour n_lines, cat1=='P'
+    pour n_planes (meme regroupement que `fisher_from_results`/`fishres`,
+    PAS uniquement 'L'/'P') - demande explicite utilisateur ("add a column
+    l/p with the number of lines and planes used in the mean Fisher for
+    the site... useful in the table for the publication"). Toujours
+    renseigne ici (une moyenne archivee par cette fonction sait forcement
+    ce qu'elle combine), au contraire d'une moyenne importee d'un autre
+    format (voir FitResult.n_lines)."""
+    vgp_lat, vgp_lon = dir_to_vgp(stats.dec, stats.inc, site_lat, site_lon)
+    vgp_dp, vgp_dm = dp_dm_from_a95(stats.a95, stats.inc)
+    codes = ":".join(str(r.c) for r in contributing if r.c)
+    n_lines = sum(1 for r in contributing if r.cat1 in _LINE_LIKE_CAT1)
+    n_planes = sum(1 for r in contributing if r.cat1 == "P")
+    return FitResult(
+        id=f"mean: {site}", cat1="F", cat2="i",
+        nb=stats.n, dec=stats.dec, inc=stats.inc, mad=stats.a95,
+        tx=(stats.k, 0.0), par3_mean=float(orientation),
+        lat=site_lat, rlong=site_lon,
+        par4=vgp_lat, par5=vgp_lon,
+        vgp_dp=vgp_dp, vgp_dm=vgp_dm,
+        component=component or "A",
+        n_lines=n_lines, n_planes=n_planes,
+        liste="codes:" + codes,
+    )
 
 
 def _mean_line_plane_counts(r: FitResult, results: List[FitResult]) -> Optional[Tuple[int, int]]:
@@ -707,12 +1068,16 @@ def list_results(results: List[FitResult], orientation: int = 1, donnees=None) -
     version anterieure de cette fonction) :
     - e95 : calcule ici (`_e95`), pure fonction de a95/inclinaison, comme
       dans le Fortran - pas une donnee stockee.
-    - "L nnn  P nnn" (compte lignes/plans composant la moyenne) : deduit
-      par recoupement de `r.liste` (les `c` des specimens composants)
-      CONTRE `results` lui-meme - fiable seulement si `results` contient
-      aussi ces specimens (typiquement `load_results(..., carselect='s')`,
-      qui les inclut expres pour cet usage) ; sinon affiche "?" plutot
-      qu'un faux "0/0" (voir `_mean_line_plane_counts`).
+    - "L nnn  P nnn" (compte lignes/plans composant la moyenne) : la valeur
+      PERSISTEE (r.n_lines/r.n_planes, voir build_site_mean_result) si
+      disponible - fiable quel que soit ce qui est charge par ailleurs.
+      Sinon (moyenne importee d'un autre format, colonne reservee mais pas
+      peuplee - voir FitResult.n_lines), repli sur l'ancien recoupement de
+      `r.liste` (les `c` des specimens composants) CONTRE `results`
+      lui-meme - fiable seulement si `results` contient aussi ces
+      specimens (typiquement `load_results(..., carselect='s')`, qui les
+      inclut expres pour cet usage) ; sinon affiche "?" plutot qu'un faux
+      "0/0" (voir `_mean_line_plane_counts`).
     - strike/dip du site : lus sur un specimen de `donnees` (parametre
       optionnel, ex. self.donnees) dont l'id commence par le nom du
       site ; affiche "?" si `donnees` n'est pas fourni.
@@ -728,17 +1093,28 @@ def list_results(results: List[FitResult], orientation: int = 1, donnees=None) -
     for i, r in enumerate(results, start=1):
         dec, inc = _correct_dec_inc(r, orientation)
         if r.id[:5] == "mean:":
-            counts = _mean_line_plane_counts(r, results)
-            lp_txt = f"L{counts[0]:3d}  P{counts[1]:3d}" if counts else "L  ?  P  ?"
+            if r.n_lines >= 0:
+                lp_txt = f"L{r.n_lines:3d}  P{r.n_planes:3d}"
+            else:
+                counts = _mean_line_plane_counts(r, results)
+                lp_txt = f"L{counts[0]:3d}  P{counts[1]:3d}" if counts else "L  ?  P  ?"
             e95 = _e95(r.mad, inc)
+            # dp/dm : la valeur ARCHIVEE (voir dp_dm_from_a95) si presente,
+            # sinon calculee a la volee depuis a95/inc (meme repli que e95
+            # ci-dessus) - couvre les moyennes archivees avant l'ajout de
+            # ces colonnes (voir _parse_mean_line, vgp_dp/vgp_dm=0.0 par
+            # defaut pour un ancien fichier).
+            dp_show, dm_show = (
+                (r.vgp_dp, r.vgp_dm) if (r.vgp_dp or r.vgp_dm) else dp_dm_from_a95(r.mad, inc)
+            )
             strdip = _mean_site_strike_dip(r, donnees)
             strdip_txt = f"str={strdip[0]:5.1f} dip={strdip[1]:4.1f}" if strdip else "str=?  dip=?"
             own_tag = _ORIENT_MODE_TAG.get(int(r.par3_mean), "?")
             lines.append(
-                f"{i:4d}: {r.id:<13s}{r.numcomp:5d}   {r.cat1}{r.cat2}    {r.orig}     {r.demag:<3s}"
+                f"{i:4d}: {r.id:<13s}[{r.component or 'A'}]{r.numcomp:4d}   {r.cat1}{r.cat2}    {r.orig}     {r.demag:<3s}"
                 f"  {lp_txt}  {r.nb:4d}  {dec:6.1f} {inc:6.1f} ({own_tag})  a95={r.mad:5.1f} e95={e95:5.1f}"
                 f"  k={r.tx[0]:8.1f}  lat={r.lat:9.5f} lon={r.rlong:9.5f}"
-                f"  VGP=({r.par4:6.1f},{r.par5:6.1f})  {strdip_txt}"
+                f"  VGP=({r.par4:6.1f},{r.par5:6.1f})  dp/dm=({dp_show:.1f}/{dm_show:.1f})  {strdip_txt}"
                 f"   [{r.liste}]"
             )
         else:
@@ -794,6 +1170,49 @@ def results_path_for(data_path: str) -> str:
     return base + ".pmagres"
 
 
+def ani_path_for(data_path: str) -> str:
+    """Equivalent de results_path_for, pour le fichier d'anisotropie
+    .pmagani (compagnon du fichier de donnees .prmag, MEME nom de base) -
+    demande explicite utilisateur ("perhaps, we should have a new .ANI
+    file that will be associated to the Prmag file") : formalise en une
+    fonction UNIQUE, nommee, ce qui etait deja fait de facon dispersee/
+    dupliquee dans app.py (4 sites derivant tour a tour de
+    self.results_path ou de results_path_for applique a self.results_path,
+    sans jamais passer par une fonction dediee comme results_path_for) -
+    meme convention que results_path_for (extension REMPLACEE, pas
+    simplement ajoutee au nom complet).
+
+    Extension ".pmagani" (et non plus ".ANI") - demande explicite
+    utilisateur ("can we write the name of the ani extension as
+    .pmagani") : nom explicitement lie a .prmag/.pmagres, alors que
+    ".ANI" restait ambigu (aussi utilise, format different, par
+    AMS_OSX_AWE/AMS_Py). Les anciens fichiers ".ANI" restent lisibles
+    directement (voir read_ani_tensor, dispatch par extension) ; leur
+    CONVERSION explicite vers .pmagani se fait cote AMS_Py (ams_selection.
+    import_legacy_ani) - demande explicite utilisateur ("in starmac_Py,
+    you can delete the import legacy .ANI file, it is better to handle
+    this in AMS_Py")."""
+    base, _ext = os.path.splitext(data_path)
+    return base + ".pmagani"
+
+
+def pmagint_path_for(data_path: str) -> str:
+    """Equivalent de results_path_for/ani_path_for, pour le fichier de
+    RESULTATS de paleointensite .pmagint (compagnon du fichier de donnees
+    .prmag, MEME nom de base) - demande explicite utilisateur ("pour
+    garder la meme logique, je souhaite avoir un fichier supplementaire
+    avec la ligne de resultats de paleointensite... qu'on pourrait
+    appeler nomfichier.pmagint comme pmagres ou pmagani. il contiendrait
+    les donnees comme dans tempint.txt"). tempint.txt (visi_Paleoint.f:
+    40,1472,1487) est le nom fige, non associe au fichier de donnees, du
+    fichier d'archivage des resultats de paleointensite que produisait
+    `openfilepint` en Fortran (jamais porte en Python jusqu'ici - voir
+    write_pmagint_line) ; .pmagint le remplace avec la convention de
+    nommage deja etablie pour .pmagres/.pmagani."""
+    base, _ext = os.path.splitext(data_path)
+    return base + ".pmagint"
+
+
 # ---------------------------------------------------------------------------
 # Format .pmagres (anciennement .r, renomme a la demande de l'utilisateur)
 # reorganise (demande explicite utilisateur, remplace l'ancien
@@ -836,12 +1255,14 @@ _MEAN_HEADER = "#site mean results"
 _SPECIMEN_FIELDS = [
     ("specimen", 12), ("step1", 7), ("step2", 7), ("L/P", 5), ("anc/not", 8),
     ("demag", 7), ("comp", 5), ("n", 6), ("dec", 7), ("inc", 7),
-    ("mad", 7), ("random", 8),
+    ("mad", 7), ("magcomp", 8), ("random", 8),
 ]
 _MEAN_FIELDS = [
     ("site", 9), ("type", 6), ("n", 5), ("dec", 7), ("inc", 7), ("a95", 7),
     ("k", 9), ("IS/TC", 7), ("lat_site", 12), ("long_site", 12),
-    ("VGP_lat", 8), ("VGP_lon", 8), ("included_samples", 0),
+    ("VGP_lat", 8), ("VGP_lon", 8), ("VGP_dp", 7), ("VGP_dm", 7),
+    ("magcomp", 8), ("L/P", 8),
+    ("included_samples", 0),
 ]
 
 # "anc"/"not" (anchored/not-anchored) au lieu de 'o'/'n' (francais
@@ -903,17 +1324,21 @@ def _format_specimen_line(res: FitResult) -> str:
         res.id, _fmt1(res.step_first), _fmt1(res.step_last),
         res.cat1, _ANCHOR_TO_FILE_CODE.get(res.orig, res.orig), res.demag,
         str(res.numcomp), str(res.nb),
-        _fmt1(res.dec), _fmt1(res.inc), _fmt1(res.mad), str(res.c),
+        _fmt1(res.dec), _fmt1(res.inc), _fmt1(res.mad),
+        (res.component or "A").strip(), str(res.c),
     ])
 
 
 def _format_mean_line(res: FitResult) -> str:
     tilt_code = _ORIENT_TO_FILE_CODE.get(res.par3_mean, _fmt1(res.par3_mean, 0))
+    lp_token = f"{res.n_lines}/{res.n_planes}" if res.n_lines >= 0 else "?/?"
     return _row(_MEAN_FIELDS, [
         _mean_site_name(res.id), "Fi", str(res.nb),
         _fmt1(res.dec), _fmt1(res.inc), _fmt1(res.mad), _fmt1(res.tx[0]),
         tilt_code, f"{res.lat:.5f}", f"{res.rlong:.5f}",
-        _fmt1(res.par4), _fmt1(res.par5), res.liste,
+        _fmt1(res.par4), _fmt1(res.par5),
+        _fmt1(res.vgp_dp), _fmt1(res.vgp_dm),
+        (res.component or "A").strip(), lp_token, res.liste,
     ])
 
 
@@ -929,13 +1354,23 @@ def _parse_specimen_line(parts: List[str]) -> Optional[FitResult]:
     if len(parts) < 12:
         return None
     try:
+        # "magcomp" (component A/B/C) insere avant `c` (random/anti-
+        # collision id, TOUJOURS le dernier champ - voir _next_specimen_c) :
+        # un fichier ecrit avant ce changement a 12 colonnes (c en
+        # dernier), un fichier ecrit apres en a 13 (magcomp puis c) -
+        # retro-compatible en verifiant le nombre de colonnes, comme
+        # vgp_dp/vgp_dm sur les lignes "mean:" (voir _parse_mean_line).
+        if len(parts) >= 13:
+            component, c = parts[11].strip() or "A", parts[12].strip()
+        else:
+            component, c = "A", parts[11].strip()
         return FitResult(
             id=parts[0].strip(),
             step_first=int(round(float(parts[1]))), step_last=int(round(float(parts[2]))),
             cat1=parts[3].strip(), orig=_parse_anchor_token(parts[4]), demag=parts[5].strip(),
             numcomp=int(parts[6]), nb=int(parts[7]),
             dec=float(parts[8]), inc=float(parts[9]), mad=float(parts[10]),
-            c=int(parts[11]),
+            component=component, c=c,
         )
     except ValueError:
         return None
@@ -949,13 +1384,50 @@ def _parse_mean_line(parts: List[str]) -> Optional[FitResult]:
         orientation = _FILE_CODE_TO_ORIENT.get(tilt_token)
         if orientation is None:
             orientation = float(tilt_token)  # retro-compat anciens fichiers (1.0/2.0/3.0)
+        # VGP_dp/VGP_dm ajoutes apres coup (demande explicite utilisateur) -
+        # colonnes optionnelles inserees AVANT `liste` : un fichier .pmagres
+        # ecrit avant ce changement n'a que 13 colonnes (liste en dernier),
+        # un fichier ecrit apres en a 15 (dp/dm avant liste) - retro-
+        # compatible en verifiant le nombre de colonnes plutot qu'un index
+        # fixe pour `liste`.
+        # "magcomp" (component A/B/C) insere apres vgp_dp/vgp_dm, "L/P"
+        # (nb lignes/plans combines, ex. "10/2" - "?/?" si non renseigne)
+        # insere apres magcomp, avant `liste` (toujours en dernier) -
+        # demandes explicites utilisateur successives. 4 longueurs
+        # possibles selon l'anciennete du fichier : 13 (avant vgp_dp/
+        # vgp_dm), 15 (vgp_dp/vgp_dm), 16 (+ magcomp), 17 (+ L/P) -
+        # verifie la plus longue en premier.
+        if len(parts) >= 17:
+            vgp_dp, vgp_dm = float(parts[12]), float(parts[13])
+            component = parts[14].strip() or "A"
+            lp_token, liste = parts[15].strip(), parts[16].strip()
+        elif len(parts) >= 16:
+            vgp_dp, vgp_dm = float(parts[12]), float(parts[13])
+            component, liste = parts[14].strip() or "A", parts[15].strip()
+            lp_token = "?/?"
+        elif len(parts) >= 15:
+            vgp_dp, vgp_dm, liste = float(parts[12]), float(parts[13]), parts[14].strip()
+            component = "A"
+            lp_token = "?/?"
+        else:
+            vgp_dp, vgp_dm, liste = 0.0, 0.0, parts[12].strip()
+            component = "A"
+            lp_token = "?/?"
+        n_lines, n_planes = -1, -1
+        if lp_token and lp_token != "?/?" and "/" in lp_token:
+            try:
+                nl_s, np_s = lp_token.split("/", 1)
+                n_lines, n_planes = int(nl_s), int(np_s)
+            except ValueError:
+                n_lines, n_planes = -1, -1
         return FitResult(
             id="mean: " + parts[0].strip(), cat1="F", cat2="i",
             nb=int(parts[2]), dec=float(parts[3]), inc=float(parts[4]), mad=float(parts[5]),
             tx=(float(parts[6]), 0.0), par3_mean=orientation,
             lat=float(parts[8]), rlong=float(parts[9]),
             par4=float(parts[10]), par5=float(parts[11]),
-            liste=parts[12].strip(),
+            vgp_dp=vgp_dp, vgp_dm=vgp_dm, component=component,
+            n_lines=n_lines, n_planes=n_planes, liste=liste,
         )
     except ValueError:
         return None
@@ -987,9 +1459,37 @@ def _iter_result_lines(path: str):
                 yield res
 
 
+def _next_specimen_c(specimen_id: str, existing_ids: set) -> str:
+    """Identifiant "<specimen>_<lettre>" (a, b, c... puis aa, ab... au-dela
+    de 26 interpretations du meme specimen, jamais observe en pratique) -
+    REMPLACE un entier aleatoire 0-99999 (l'ancien schema) suite a un
+    fichier reel corrompu (Tibet_14_15_Pmag_.r, deux campagnes de terrain
+    fusionnees dans un seul .r) : 91 valeurs "c" dupliquees sur 1213,
+    certaines associant meme un resultat specimen et une moyenne "mean:"
+    totalement sans rapport - demande explicite utilisateur ("the most
+    simple might be specimen_a, specimen_b instead of a random number as
+    it is unlikely to have so many interpretations by specimen"). Un
+    entier purement aleatoire peut coincider entre deux specimens SANS
+    RAPPORT des que deux fichiers generes independamment sont fusionnes ;
+    cet identifiant porte deja le nom du specimen - une collision
+    necessiterait desormais le MEME specimen ET la MEME lettre (une
+    veritable duplication de la meme interpretation, facilement reperee),
+    pas un accident purement numerique."""
+    for letter in string.ascii_lowercase:
+        candidate = f"{specimen_id}_{letter}"
+        if candidate not in existing_ids:
+            return candidate
+    for l1 in string.ascii_lowercase:
+        for l2 in string.ascii_lowercase:
+            candidate = f"{specimen_id}_{l1}{l2}"
+            if candidate not in existing_ids:
+                return candidate
+    raise RuntimeError(f"too many interpretations stored for specimen {specimen_id}")
+
+
 def archivres(
     res: FitResult, path: str, existing_ids: Optional[set] = None
-) -> Tuple[int, set]:
+) -> Tuple[str, set]:
     """Equivalent de `archivres`, mais insere CHAQUE resultat dans la
     bonne section plutot que de toujours ajouter en fin de fichier brut
     (demande explicite utilisateur : "can we split in two the file and
@@ -998,20 +1498,16 @@ def archivres(
     avant l'en-tete "#site mean results" s'il existe deja, en sautant les
     lignes vides qui la precedent pour ne pas casser l'espacement) ; une
     moyenne de site va toujours en fin de fichier (section 2, creee au
-    besoin avec son propre en-tete). Genere un id anti-collision aleatoire
-    (equivalent de la boucle `randomnum`/`read` qui reessaie jusqu'a 10000
-    fois) - `existing_ids` : ensemble des `c`/`random` deja connus (evite
-    de rouvrir le fichier a chaque appel ; passer None la premiere fois
-    puis reutiliser l'ensemble retourne). Retourne `(c attribue,
-    existing_ids mis a jour)`."""
+    besoin avec son propre en-tete). Genere un id anti-collision
+    "<specimen>_<lettre>" (voir _next_specimen_c - REMPLACE l'ancien
+    entier aleatoire 0-99999) - `existing_ids` : ensemble des `c`/`random`
+    deja connus (evite de rouvrir le fichier a chaque appel ; passer None
+    la premiere fois puis reutiliser l'ensemble retourne). Retourne `(c
+    attribue, existing_ids mis a jour)`."""
     if existing_ids is None:
         existing_ids = {r.c for r in _iter_result_lines(path)}
 
-    c = random.randint(0, 99999)
-    tries = 0
-    while c in existing_ids and tries < 10000:
-        c = random.randint(0, 99999)
-        tries += 1
+    c = _next_specimen_c(res.id, existing_ids)
     existing_ids.add(c)
     res.c = c
 
@@ -1048,6 +1544,15 @@ def archivres(
 
     with open(path, "w", encoding="iso-8859-1", errors="replace", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
+        # flush explicite (buffer Python) + fsync (cache OS -> disque) - demande
+        # explicite utilisateur ("is it possible to flush the buffer after the
+        # result is written, to be sure that the text is written") : chaque
+        # resultat est archive individuellement au fil de la session (voir
+        # docstring ci-dessus), un crash/force-quit juste apres un calcul ne
+        # doit pas pouvoir perdre ce resultat parce qu'il ne serait encore
+        # que dans un buffer (Python et/ou OS), pas sur le disque.
+        f.flush()
+        os.fsync(f.fileno())
     return c, existing_ids
 
 
@@ -1147,7 +1652,7 @@ def _parse_legacy_result_line(line: str) -> Optional[FitResult]:
 
     try:
         prefix_kwargs = dict(
-            c=int(seg("c")), id=seg("id").strip(),
+            c=seg("c").strip(), id=seg("id").strip(),
             cin=float(seg("cin")), caz=float(seg("caz")),
             dip=float(seg("dip")), str_=float(seg("str_")),
             cat1=seg("cat1"), cat2=seg("cat2"),
@@ -1185,17 +1690,55 @@ def _parse_legacy_result_line(line: str) -> Optional[FitResult]:
         return None
 
 
-def convert_legacy_results_file(old_path: str, new_path: str) -> int:
+def convert_legacy_results_file(old_path: str, new_path: str) -> Tuple[int, List[str]]:
     """Convertit un ANCIEN fichier .r (colonnes fixes) vers le nouveau
     .pmagres (sections specimen/site mean, colonnes auto-descriptives).
     tx/ty/tz de l'ancien fichier sont IGNORES (pas ecrits dans le nouveau
     format - voir recompute_fit_geometry, qui les recalcule a la demande).
-    Retourne le nombre de resultats convertis (0 si `old_path` n'existe
-    pas ou ne contient aucune ligne reconnue - `new_path` n'est alors pas
-    cree)."""
-    if not os.path.exists(old_path):
-        return 0
 
+    RENUMEROTE au passage chaque `c`/"random" en "<specimen>_<lettre>"
+    (voir _next_specimen_c) plutot que de recopier l'ancien entier
+    0-99999 tel quel - demande explicite utilisateur, suite a un fichier
+    reel corrompu (Tibet_14_15_Pmag_.r, deux campagnes de terrain
+    fusionnees dans un seul .r ancien format) : l'ancien entier ALEATOIRE
+    entrait en collision entre deux specimens SANS RAPPORT, corrompant
+    silencieusement les "codes:" des moyennes de site ("can you check the
+    random number... perhaps rename it site_rannum... the most simple
+    might be specimen_a, specimen_b instead of a random number... can you
+    implement this in the import legacy file").
+
+    La reconstruction des "codes:" d'une moyenne relit chaque ANCIEN
+    numero de sa liste et le retrouve dans une table {ancien numero ->
+    nouvel id}, mise a jour au fur et a mesure que les lignes specimen
+    sont lues - PAS une fenetre positionnelle "les N dernieres lignes
+    lues" (un premier essai de cette fonction faisait cette hypothese ;
+    fausse sur donnees reelles : un site peut lister TOUS ses resultats
+    specimen de PLUSIEURS composantes d'affilee, puis PLUSIEURS paires de
+    moyennes a la fin - chacune resumant un SOUS-ENSEMBLE different, pas
+    forcement le plus recent - verifie sur le site "14NQ04" du fichier
+    reel : 22 resultats specimen (2 groupes de 11) precedent 4 lignes
+    "mean:", les 2 premieres resumant le 1er groupe, les 2 suivantes le
+    2e). La table est indexee par l'ANCIEN numero justement PARCE QU'il
+    reste unique LOCALEMENT (les collisions reelles n'existent qu'ENTRE
+    sites distants du fichier, jamais entre deux resultats d'un meme
+    site - verifie sur le fichier reel) - une entree peut donc etre
+    ecrasee par un doublon plus loin dans le fichier SANS consequence, la
+    moyenne concernee ayant deja consomme la bonne valeur avant que ce
+    doublon distant n'apparaisse. Un ancien numero reference par une
+    moyenne mais introuvable dans la table (jamais vu, ou deja ecrase par
+    un doublon survenu ENTRE temps - non observe sur le fichier reel mais
+    possible en theorie) est signale dans les avertissements retournes
+    plutot que de deviner une correspondance fausse.
+
+    Retourne (nombre de resultats convertis, avertissements) - (0, [])
+    si `old_path` n'existe pas ou ne contient aucune ligne reconnue
+    (`new_path` n'est alors pas cree)."""
+    if not os.path.exists(old_path):
+        return 0, []
+
+    letter_counts: Dict[str, int] = {}
+    old_c_to_new: Dict[str, str] = {}
+    warnings: List[str] = []
     specimen_lines, mean_lines = [], []
     with open(old_path, "r", encoding="iso-8859-1", errors="replace") as f:
         for raw in f:
@@ -1203,12 +1746,53 @@ def convert_legacy_results_file(old_path: str, new_path: str) -> int:
             if res is None:
                 continue
             if res.id[:5] == "mean:":
+                old_codes = [t for t in res.liste.replace("codes:", "").split(":") if t.strip()]
+                new_codes = []
+                missing = []
+                for old_c in old_codes:
+                    new_c = old_c_to_new.get(old_c)
+                    if new_c is None:
+                        # Repli OBSERVE sur un fichier reel (Tibet_14_15_Pmag_.r,
+                        # sites 14NQ13/14NQ15/14NQ23) : un "6" de tete manquant
+                        # de facon DETERMINISTE (ex. "8624" au lieu de "68624") -
+                        # confirme sur 3 cas independants, dont 2 ou le meme
+                        # specimen apparait CORRECTEMENT (avec le "6") dans une
+                        # AUTRE moyenne du meme fichier - probable troncature
+                        # d'un champ largeur fixe cote Fortran d'origine, pas
+                        # une simple coincidence. Recupere ce cas precis (SEUL
+                        # candidat "6"+old_c connu) plutot que de le signaler
+                        # manquant, mais le note explicitement (pas silencieux)
+                        # pour verification par l'utilisateur.
+                        recovered = old_c_to_new.get("6" + old_c)
+                        if recovered is not None:
+                            new_codes.append(recovered)
+                            warnings.append(
+                                f"{res.id}: old id '{old_c}' not found as-is, recovered as "
+                                f"'6{old_c}' -> {recovered} (likely dropped leading digit "
+                                f"'6' - please verify)."
+                            )
+                        else:
+                            missing.append(old_c)
+                    else:
+                        new_codes.append(new_c)
+                if missing:
+                    warnings.append(
+                        f"{res.id}: {len(missing)} of {len(old_codes)} referenced specimen "
+                        f"result(s) not found (old id(s) {missing}) - codes list left incomplete."
+                    )
+                res.liste = "codes:" + ":".join(new_codes)
                 mean_lines.append(_format_mean_line(res))
             else:
+                old_c = res.c
+                n = letter_counts.get(res.id, 0)
+                letter = string.ascii_lowercase[n] if n < 26 else f"{string.ascii_lowercase[n // 26 - 1]}{string.ascii_lowercase[n % 26]}"
+                letter_counts[res.id] = n + 1
+                res.c = f"{res.id}_{letter}"
+                old_c_to_new[old_c] = res.c
                 specimen_lines.append(_format_specimen_line(res))
 
     if not specimen_lines and not mean_lines:
-        return 0
+        return 0, warnings
 
     out_lines: List[str] = []
     if specimen_lines:
@@ -1220,19 +1804,23 @@ def convert_legacy_results_file(old_path: str, new_path: str) -> int:
 
     with open(new_path, "w", encoding="iso-8859-1", errors="replace", newline="\n") as f:
         f.write("\n".join(out_lines) + "\n")
-    return len(specimen_lines) + len(mean_lines)
+        f.flush()
+        os.fsync(f.fileno())
+    return len(specimen_lines) + len(mean_lines), warnings
 
 
 def _load_data_results(
-    path: str, pattern: str, cat1: str, numcomp: Optional[int]
+    path: str, pattern: str, cat1: str, numcomp: Optional[int], component: str = "*"
 ) -> List[FitResult]:
     """Equivalent de la branche `carselect=="d"` (par defaut) de `selres` :
     resultats normaux (L/P/f/s...), les lignes "mean:" sont exclues -
     fidele au Fortran, ou une ligne mean ne matche NI la branche mean
     (carselect!='m') NI la branche normale (verifie `chaineres(10:15).ne.
-    "mean: "`)."""
+    "mean: "`). `component` : filtre PAS dans le Fortran (voir
+    FitResult.component) - "*" (defaut) = pas de filtre."""
     pattern = (pattern or "*").upper().strip()
     nlen = len(pattern) if pattern != "*" else 0
+    component = (component or "*").strip()
     results = []
     for res in _iter_result_lines(path):
         if res.id[:5] == "mean:":
@@ -1243,19 +1831,28 @@ def _load_data_results(
             continue
         if numcomp is not None and res.numcomp != numcomp:
             continue
+        if component != "*" and (res.component or "A").upper() != component.upper():
+            continue
         results.append(res)
     return results
 
 
-def _load_mean_results(path: str, pattern: str, iorient: int) -> List[FitResult]:
+def _load_mean_results(
+    path: str, pattern: str, iorient: int, component: str = "*"
+) -> List[FitResult]:
     """Equivalent de la branche `carselect=="m"` de `selres` : UNIQUEMENT les
     moyennes de site ("mean: <site>"), filtrees par `res.par3==float(iorient)`
     (le code d'orientation enregistre avec la moyenne) et par `pattern`
     (compare apres le prefixe "mean: ", ajoute automatiquement - equivalent
-    de `enteteres="mean: "//entete` puis `numero=enteteres//chaine`)."""
+    de `enteteres="mean: "//entete` puis `numero=enteteres//chaine`).
+    `component` : filtre PAS dans le Fortran (voir FitResult.component) -
+    "*" (defaut) = pas de filtre. Compare la propre etiquette de LA
+    MOYENNE, jamais celle de ses resultats constitutifs ("I think it is
+    best not to use the numcomp of individual samples for the mean")."""
     site = (pattern or "*").strip()
     full_pattern = "*" if site in ("", "*") else f"MEAN: {site.upper()}"
     nlen = len(full_pattern) if full_pattern != "*" else 0
+    component = (component or "*").strip()
 
     results = []
     for res in _iter_result_lines(path):
@@ -1264,6 +1861,8 @@ def _load_mean_results(path: str, pattern: str, iorient: int) -> List[FitResult]
         if res.par3_mean != float(iorient):
             continue
         if full_pattern != "*" and res.id[:nlen].upper() != full_pattern[:nlen]:
+            continue
+        if component != "*" and (res.component or "A").upper() != component.upper():
             continue
         results.append(res)
     return results
@@ -1291,28 +1890,44 @@ def available_mean_orientations(path: str, pattern: str = "*") -> List[int]:
     return sorted(found)
 
 
-def _load_site_results(path: str, pattern: str, iorient: int) -> List[FitResult]:
+def _load_site_results(
+    path: str, pattern: str, iorient: int, component: str = "*"
+) -> List[FitResult]:
     """Equivalent de la branche `carselect=="s"` de `selres` (label 444) :
     les moyennes matchees par `_load_mean_results`, PLUS pour chacune les
     resultats individuels references dans son champ `liste`
     ("codes:c1:c2:...", les `c` des resultats combines) - equivalent de
-    `decodelisteres` (recherche par `c`, ajout sans autre filtre)."""
-    means = _load_mean_results(path, pattern, iorient)
+    `decodelisteres` (recherche par `c`, ajout sans autre filtre).
+    `component` filtre le CHOIX de la/les moyenne(s) (voir
+    _load_mean_results) - les resultats individuels associes suivent
+    ensuite sans filtre supplementaire, quelle que soit leur propre
+    etiquette component.
+
+    Ordre du resultat : POUR CHAQUE moyenne, ses lignes/plans individuels
+    D'ABORD, puis la moyenne elle-meme, repete pour chaque moyenne
+    selectionnee - demande explicite utilisateur ("after the selection
+    site+best fits, is it possible to list the lines involved in the
+    mean, then the mean, for all selected means"). PAS l'ordre du Fortran
+    d'origine (qui listait toutes les moyennes d'abord, puis tous les
+    specimens ensuite en un seul bloc separe) - purement l'ordre
+    d'affichage/de self.results, n'affecte aucun calcul (fisher_from_results
+    etc. ne dependent pas de l'ordre)."""
+    means = _load_mean_results(path, pattern, iorient, component=component)
     if not means:
         return means
 
-    results = list(means)
+    results: List[FitResult] = []
     for mean_res in means:
         wanted = set()
         for token in mean_res.liste.replace("codes:", "").split(":"):
             token = token.strip()
-            if token.isdigit():
-                wanted.add(int(token))
-        if not wanted:
-            continue
-        for res in _iter_result_lines(path):
-            if res.id[:5] != "mean:" and res.c in wanted:
-                results.append(res)
+            if token:
+                wanted.add(token)
+        if wanted:
+            for res in _iter_result_lines(path):
+                if res.id[:5] != "mean:" and res.c in wanted:
+                    results.append(res)
+        results.append(mean_res)
     return results
 
 
@@ -1323,6 +1938,7 @@ def load_results(
     cat1: str = "*",
     numcomp: Optional[int] = None,
     iorient: int = 1,
+    component: str = "*",
 ) -> List[FitResult]:
     """Equivalent de `selres` (dataselect.f), les 3 modes `carselect` :
 
@@ -1334,15 +1950,25 @@ def load_results(
       `numcomp` ignores (pas prompted par le Fortran en mode Mean).
     - 's' (Site = Data+Mean) : une moyenne matchee (meme filtre que 'm')
       PLUS les resultats individuels qui la composent (son champ `liste`).
+
+    `component` : filtre PAS dans le Fortran, sur FitResult.component
+    (A/B/C..., voir sa docstring) - demande explicite utilisateur pour
+    distinguer plusieurs moyennes d'un meme site portant des composantes
+    de magnetisation differentes ("when there is different components of
+    magnetizations within the same site, we may have two or three means
+    by site... We need to add a column component"). "*" (defaut) = pas de
+    filtre, applicable aux 3 modes. En mode 'm'/'s', compare l'etiquette
+    de LA MOYENNE elle-meme, jamais celle de ses resultats individuels
+    constitutifs.
     """
     if not os.path.exists(path):
         return []
     carselect = (carselect or "d").strip().lower()
     if carselect == "m":
-        return _load_mean_results(path, pattern, iorient)
+        return _load_mean_results(path, pattern, iorient, component=component)
     if carselect == "s":
-        return _load_site_results(path, pattern, iorient)
-    return _load_data_results(path, pattern, cat1, numcomp)
+        return _load_site_results(path, pattern, iorient, component=component)
+    return _load_data_results(path, pattern, cat1, numcomp, component=component)
 
 
 # ---------------------------------------------------------------------------
@@ -1490,19 +2116,40 @@ def compute_mean_intensity(selected: List[SelectedSample]) -> Optional[MeanInten
     """Equivalent de `mdi` : moyennes arithmetique/geometrique de l'intensite
     (norme du moment) sur TOUTES les mesures de la selection. None si la
     selection melange des normalisations masse/volume (comme le Fortran :
-    "on ne peut pas melanger les choux et les carottes"), ou si <=1 mesure."""
+    "on ne peut pas melanger les choux et les carottes"), ou si <=1 mesure.
+
+    None aussi si la selection melange des specimens AVEC et SANS volume/
+    masse renseigne (meme categorie d'incompatibilite que masse/volume
+    melanges - une moyenne ne peut pas melanger des Am2 bruts avec des A/m
+    normalises). Si AUCUN specimen n'a de volume/masse, calcule la moyenne
+    du moment total BRUT (Am2) plutot que d'appliquer quand meme le
+    facteur 1e3/1e6 a un volume absent (bug Fortran confirme - le Fortran
+    d'origine divisait toujours par ech.vol sans le verifier) - demande
+    explicite utilisateur ("when the volume or the mass of the sample is
+    not given, best to show the data in total moment as done in the
+    list")."""
     if not selected:
         return None
     norme0 = selected[0].norme
     if any(ech.norme != norme0 for ech in selected[1:]):
         return None
+    has_vol0 = bool(selected[0].vol)
+    if any(bool(ech.vol) != has_vol0 for ech in selected[1:]):
+        return None
 
-    factor = 1.0e3 if norme0 == "m" else 1.0e6
-    unit = "Am2/kg" if norme0 == "m" else "A/m"
-    rint = [
-        math.sqrt(m.x ** 2 + m.y ** 2 + m.z ** 2) * factor / (ech.vol or 1.0)
-        for ech in selected for m in ech.mesures
-    ]
+    if not has_vol0:
+        unit = "Am2"
+        rint = [
+            math.sqrt(m.x ** 2 + m.y ** 2 + m.z ** 2)
+            for ech in selected for m in ech.mesures
+        ]
+    else:
+        factor = 1.0e3 if norme0 == "m" else 1.0e6
+        unit = "Am2/kg" if norme0 == "m" else "A/m"
+        rint = [
+            math.sqrt(m.x ** 2 + m.y ** 2 + m.z ** 2) * factor / ech.vol
+            for ech in selected for m in ech.mesures
+        ]
     if len(rint) <= 1:
         return None
 
@@ -1517,10 +2164,19 @@ def compute_mean_intensity(selected: List[SelectedSample]) -> Optional[MeanInten
 def compute_mean_susceptibility(selected: List[SelectedSample]) -> Optional[MeanSuscResult]:
     """Equivalent de `mds`, appele par `mdi`. None si <=2 mesures avec
     susceptibilite non nulle (comme le Fortran, `if(itot==1) return` /
-    `if(itot==2) return`)."""
+    `if(itot==2) return`).
+
+    Specimens SANS volume/masse (0/None) EXCLUS de cette moyenne - PAS de
+    "total brut" honnete pour une susceptibilite (contrairement au moment,
+    qui a un equivalent Am2 non normalise significatif - voir
+    compute_mean_intensity) : mieux vaut ne pas inclure une valeur
+    faussee que d'appliquer quand meme le facteur 1e-4 a un volume absent
+    comme le faisait le Fortran d'origine (demande explicite utilisateur,
+    "the previous Fortran was systematically dividing by mass and volume
+    and was not expecting no vol and no mass")."""
     suscint = [
-        m.s * 1e-4 / (ech.vol or 1.0)
-        for ech in selected for m in ech.mesures if m.s != 0.0
+        m.s * 1e-4 / ech.vol
+        for ech in selected for m in ech.mesures if m.s != 0.0 and ech.vol
     ]
     if len(suscint) <= 2:
         return None
@@ -1657,7 +2313,14 @@ class KoenigsbergerRow:
 
 
 def compute_koenigsberger(selected: List[SelectedSample], valk: float) -> List[KoenigsbergerRow]:
-    """Equivalent de `Koenigs` : `valk` = champ de reference en microteslas."""
+    """Equivalent de `Koenigs` : `valk` = champ de reference en microteslas.
+    `ratio` (Qn, le resultat analytique principal) est INVARIANT a un
+    volume/masse absent (le meme facteur divise rxx et rind, s'annule
+    dans le quotient) ; `mag`/`ind_mag` (valeurs intermediaires affichees)
+    ne recoivent pas le facteur 1e3/1e6/1e-7 sans volume/masse (0/None) -
+    demande explicite utilisateur ("the previous Fortran was
+    systematically dividing by mass and volume and was not expecting no
+    vol and no mass"), meme principe que compute_mean_intensity."""
     valc = valk / (4 * math.pi / 10.0)
     rows = []
     for ech in selected:
@@ -1666,7 +2329,9 @@ def compute_koenigsberger(selected: List[SelectedSample], valk: float) -> List[K
             if m.s == 0.0:
                 continue
             rxx = math.sqrt(m.x ** 2 + m.y ** 2 + m.z ** 2)
-            if ech.norme == "m":
+            if not ech.vol:
+                rind = valc * m.s
+            elif ech.norme == "m":
                 rxx = rxx * 1.0e3 / vol
                 rind = valc * m.s * 1e-7 / vol
             else:
@@ -1699,14 +2364,15 @@ def list_diff_measurements(selected: List[SelectedSample], orientation: int = 1)
     lines = []
     ij = 1
     for ech in selected:
-        vol = ech.vol or 1.0
-        factor = 1.0e3 if ech.norme == "m" else 1.0e6
         for j in range(len(ech.mesures) - 1):
             a, b = ech.mesures[j], ech.mesures[j + 1]
             dx, dy, dz = a.x - b.x, a.y - b.y, a.z - b.z
             xx, yy, zz = apply_orientation(dx, dy, dz, ech, orientation)
             mag, dec, inc = polere(xx, yy, zz)
-            mag = mag * factor / vol
+            # sans volume/masse (0/None) : moment total brut (Am2), pas un
+            # faux nombre issu d'une division par un volume absent (bug
+            # Fortran confirme) - demande explicite utilisateur.
+            mag, _unit = normalized_intensity(ech, mag)
             lines.append(
                 f"{ij:4d}: {ech.id:<12s}  {a.etape:4d}{a.cod1}{a.cod2}  "
                 f"{mag:10.3e} {dec:6.1f} {inc:6.1f}  q={a.q:<4d} {a.ins:<2s} s={a.s:.1f}"
@@ -1893,12 +2559,28 @@ def format_cooling_rate(r: CoolingRateResult) -> str:
 # ---------------------------------------------------------------------------
 # anisot / anisoauto : calcul du tenseur d'anisotropie (ARM/TRM 6 positions)
 # - calcul.f:2418-3310 (anisot, saisie manuelle) / 3951-4900+ (anisoauto,
-# detection automatique). Ne porte QUE la variante 'A0' (tenseur de base,
-# calcule directement sur les 6 mesures reelles) - PAS les 14 variantes
-# jackknife (A+/A-/A1-A6/B1-B6, reconstruction de chaque position tour a
-# tour pour evaluer la robustesse) ni le bloc de correction d'alteration/
-# evolution (testevol) : deferrees a une etape ulterieure (demande
-# explicite de l'utilisateur, "Etape 1").
+# detection automatique). Porte desormais LES 15 VARIANTES ecrites par le
+# Fortran (A0/A+/A-/A1/B1/A2/B2/A3/B3/A4/B4/A5/B5/A6/B6 - demande explicite
+# utilisateur "implement the 15 outputs for the anisotropy tensor with the
+# A0 code being the major one" - "Etape 2" de la demande initiale, qui
+# avait deliberement differe ces 14 variantes "jackknife"). Le bloc de
+# correction d'alteration/evolution (testevol) reste hors perimetre.
+#
+# Principe des 14 variantes au-dela de A0 (calcul.f:2691-3256) : A0 =
+# demi-difference +/- par paire d'axes (s'annule pour tout offset commun
+# aux deux mesures, ex. NRM residuelle - LE tenseur "officiel"). Les
+# variantes A+/A- reprennent les MEMES composantes que A0 mais SANS les
+# symetriser (A+ = triangle "ligne i", A- = triangle "colonne i", i.e.
+# "transpose"). Les paires (A1,B1)/(A2,B2) soustraient la MOYENNE (pas la
+# demi-difference) de la paire X (`anrmx*`, une estimation du "bruit"/
+# remanence parasite commune a X+ et X-) aux 3 mesures "+" (A1) ou "-"
+# (A2, signe inverse) de CHAQUE paire d'axes - (A3,B3)/(A4,B4) et
+# (A5,B5)/(A6,B6) refont le meme calcul en soustrayant la moyenne de la
+# paire Y, puis de la paire Z, respectivement. Comparer ces 14 variantes
+# a A0 sert de diagnostic de robustesse (une forte divergence signale que
+# la remanence parasite/NRM residuelle contamine significativement le
+# tenseur mesure) - aucune n'est "la" mesure a utiliser en aval (voir
+# compute_anicor_factor, qui continue a n'utiliser QUE A0).
 #
 # VERIFIE OCTET-PRES contre un vrai fichier .ANI fourni par l'utilisateur
 # (Miriam_2025b/SanJuan_Pmag.ANI, echantillon "02A", etape 460) : calcul a
@@ -1918,6 +2600,28 @@ class AniTensor:
     k12: float
     k23: float
     k13: float
+    # Champs ajoutes pour le format .pmagani (voir write_ani_tensors/
+    # read_ani_tensor) - demande explicite utilisateur ("What will be the
+    # most complete .pmagani file") : nombre de positions ayant servi au
+    # calcul et statistiques de Hext (sigma, test F global/F12/F23), issues
+    # UNIQUEMENT du chemin PmagPy (voir anisotropy_magic.compute_aarm_
+    # pmagpy) - le calcul natif Starmac (jackknife geometrique, calcul.f)
+    # ne les calcule pas ; None/absent si non disponible.
+    n_positions: Optional[int] = None
+    sigma: Optional[float] = None
+    ftest: Optional[float] = None
+    ftest12: Optional[float] = None
+    ftest23: Optional[float] = None
+    # f_crit/quality : valeur F critique (95%, Hext 1963) et verdict 'g'
+    # (F>F_crit, anisotropie significative)/'b' (non significative), issus
+    # de pmagpy (params["aniso_ftest_quality"]) - PAS des colonnes .pmagani
+    # dediees (le fichier reste au meme schema), seulement utilises pour
+    # composer la note "satisfactory/not satisfactory" dans la colonne
+    # info (voir _format_pmagani_line) - demande explicite utilisateur
+    # ("ajouter le calcul de PmagPy et les erreurs dans pmagani, ainsi que
+    # l'estimation dans le comment satisfactory or not satisfactory").
+    f_crit: Optional[float] = None
+    quality: Optional[str] = None
 
 
 _ANI_CODE2 = {1: "A0", 2: "F0", 3: "N0"}
@@ -1938,7 +2642,24 @@ def detect_six_positions(
     substitut R normal, pour la reclassification apres detection d'une
     evolution/alteration significative (calcul.f:4107 `Zplus="ZB"`).
     Retourne None si l'etape X est absente ou si les 6 positions ne sont
-    pas toutes identifiees (equivalent "decoding incomplete" du Fortran)."""
+    pas toutes identifiees (equivalent "decoding incomplete" du Fortran).
+
+    BUG Fortran CONFIRME et CORRIGE ici (pas silencieusement reproduit -
+    demande explicite utilisateur : "the determination of anisotropy does
+    not work; I tried on the magic contribution 20595") : le Fortran
+    d'origine (calcul.f:4011-4013) cherche un substitut 'R'/'V' a l'etape
+    X SANS JAMAIS VERIFIER qu'une vraie mesure Z+/Z- (cod1='Z') existe
+    deja a cette meme etape - un 'R'/'V' present pour une AUTRE raison (ex.
+    une experience de paleointensite sur le meme specimen dont un pas
+    partage accidentellement le meme numero d'etape que l'anisotropie)
+    ecrase alors la vraie mesure Z+/Z- deja trouvee (dernier match gagne,
+    dans le Fortran comme dans le port). Confirme sur une contribution
+    MagIC reelle (20595, specimen HP01-01) : etape 600 porte a la fois
+    Z+/Z- reels ET des mesures 'R0'/'RN' issues d'un protocole Thellier
+    separe sur le meme specimen - le tenseur resultant etait corrompu
+    (k33 proche de zero, incoherent avec k11/k22). Desormais, le substitut
+    R/V n'est cherche QUE pour l'axe (Z+ et/ou Z-) qui n'a PAS deja de
+    vraie mesure a cette etape."""
     item_rv = None
     for m in ech.mesures:
         if m.cod1 == "X":
@@ -1946,13 +2667,16 @@ def detect_six_positions(
     if item_rv is None:
         return None
 
+    has_real_zplus = any(m.etape == item_rv and m.cod1 == "Z" and m.cod2 == "+" for m in ech.mesures)
+    has_real_zminus = any(m.etape == item_rv and m.cod1 == "Z" and m.cod2 == "-" for m in ech.mesures)
+
     zplus_label = zminus_label = None
     for m in ech.mesures:
         if m.etape != item_rv:
             continue
-        if m.cod1 == "R":
+        if m.cod1 == "R" and not has_real_zplus:
             zplus_label = m.cod1 + m.cod2
-        elif m.cod1 == "V":
+        elif m.cod1 == "V" and not has_real_zminus:
             zminus_label = m.cod1 + m.cod2
     if force_zplus_label:
         zplus_label = force_zplus_label
@@ -2111,7 +2835,8 @@ class AnisotropyComputation:
     symetrisation (`raw`) et les diagnostics par position sont le seul
     moyen de verifier qu'un echantillon etait bien oriente lors de
     l'acquisition de la TRM."""
-    tensor: AniTensor  # 'A0', symetrise
+    tensor: AniTensor  # 'A0', symetrise - LE tenseur "officiel" (voir all_tensors)
+    all_tensors: List[AniTensor]  # les 15 variantes (A0 en premier), voir _all_ani_variants
     raw: Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]
     positions: Dict[str, Measurement]
     holder_used: bool
@@ -2121,6 +2846,78 @@ class AnisotropyComputation:
     swapped_axes: List[str]  # ex. ['X'] si une inversion a ete corrigee
     trm_evolution_pct: Optional[float]  # `TRMevol`, None si pas de ZB trouvee
     zb_used: bool  # Zplus remplace par ZB (evolution > seuil + use_zb_on_evolution)
+
+
+def _all_ani_variants(
+    id_: str,
+    xpx: float, xpy: float, xpz: float, xmx: float, xmy: float, xmz: float,
+    ypx: float, ypy: float, ypz: float, ymx: float, ymy: float, ymz: float,
+    zpx: float, zpy: float, zpz: float, zmx: float, zmy: float, zmz: float,
+) -> List[AniTensor]:
+    """Port exact de calcul.f:2691-3256 (bloc d'ecriture des 15 lignes du
+    .ANI, dans anisot/anisoauto) - voir le commentaire au-dessus de
+    AnisotropyComputation pour le principe. Composantes nommees d'apres
+    la convention Fortran (`xpx`=mes(ixp).x, etc, 0-indexe X+,X-,Y+,Y-,
+    Z+,Z- dans cet ordre) - deja corrigees de la ligne de base porte-
+    echantillon si applicable (memes vecteurs que ceux utilises pour A0).
+    Retourne les 15 AniTensor dans l'ordre A0,A+,A-,A1,B1,A2,B2,A3,B3,A4,
+    B4,A5,B5,A6,B6."""
+    tensors: List[AniTensor] = []
+
+    def add(code2: str, k11: float, k22: float, k33: float, k12: float, k23: float, k13: float) -> None:
+        tensors.append(AniTensor(id=id_, code2=code2, k11=k11, k22=k22, k33=k33, k12=k12, k23=k23, k13=k13))
+
+    # Groupe 0 : demi-difference +/- par paire d'axes (A0=symetrise,
+    # A+/A- = les 2 triangles non symetrises).
+    ani011, ani012, ani013 = (xpx - xmx) / 2, (xpy - xmy) / 2, (xpz - xmz) / 2
+    ani021, ani022, ani023 = (ypx - ymx) / 2, (ypy - ymy) / 2, (ypz - ymz) / 2
+    ani031, ani032, ani033 = (zpx - zmx) / 2, (zpy - zmy) / 2, (zpz - zmz) / 2
+    add("A0", ani011, ani022, ani033, (ani012 + ani021) / 2, (ani032 + ani023) / 2, (ani013 + ani031) / 2)
+    add("A+", ani011, ani022, ani033, ani012, ani023, ani013)
+    add("A-", ani011, ani022, ani033, ani021, ani032, ani031)
+
+    # Groupe 1/2 : moyenne de la paire X (bruit/remanence parasite commune
+    # a X+/X-) soustraite des 3 mesures "+" (A1) et "-" (B... A2, signe
+    # inverse) de chaque paire d'axes.
+    anrmxx, anrmxy, anrmxz = (xpx + xmx) / 2, (xpy + xmy) / 2, (xpz + xmz) / 2
+    ani111, ani112, ani113 = xpx - anrmxx, xpy - anrmxy, xpz - anrmxz
+    ani121, ani122, ani123 = ypx - anrmxx, ypy - anrmxy, ypz - anrmxz
+    ani131, ani132, ani133 = zpx - anrmxx, zpy - anrmxy, zpz - anrmxz
+    ani211, ani212, ani213 = -(xmx - anrmxx), -(xmy - anrmxy), -(xmz - anrmxz)
+    ani221, ani222, ani223 = -(ymx - anrmxx), -(ymy - anrmxy), -(ymz - anrmxz)
+    ani231, ani232, ani233 = -(zmx - anrmxx), -(zmy - anrmxy), -(zmz - anrmxz)
+    add("A1", ani111, ani122, ani133, ani112, ani123, ani113)
+    add("B1", ani111, ani122, ani133, ani121, ani132, ani131)
+    add("A2", ani211, ani222, ani233, ani212, ani223, ani213)
+    add("B2", ani211, ani222, ani233, ani221, ani232, ani231)
+
+    # Groupe 3/4 : idem, moyenne de la paire Y.
+    anrmyx, anrmyy, anrmyz = (ypx + ymx) / 2, (ypy + ymy) / 2, (ypz + ymz) / 2
+    ani311, ani312, ani313 = xpx - anrmyx, xpy - anrmyy, xpz - anrmyz
+    ani321, ani322, ani323 = ypx - anrmyx, ypy - anrmyy, ypz - anrmyz
+    ani331, ani332, ani333 = zpx - anrmyx, zpy - anrmyy, zpz - anrmyz
+    ani411, ani412, ani413 = -(xmx - anrmyx), -(xmy - anrmyy), -(xmz - anrmyz)
+    ani421, ani422, ani423 = -(ymx - anrmyx), -(ymy - anrmyy), -(ymz - anrmyz)
+    ani431, ani432, ani433 = -(zmx - anrmyx), -(zmy - anrmyy), -(zmz - anrmyz)
+    add("A3", ani311, ani322, ani333, ani312, ani323, ani313)
+    add("B3", ani311, ani322, ani333, ani321, ani332, ani331)
+    add("A4", ani411, ani422, ani433, ani412, ani423, ani413)
+    add("B4", ani411, ani422, ani433, ani421, ani432, ani431)
+
+    # Groupe 5/6 : idem, moyenne de la paire Z.
+    anrmzx, anrmzy, anrmzz = (zpx + zmx) / 2, (zpy + zmy) / 2, (zpz + zmz) / 2
+    ani511, ani512, ani513 = xpx - anrmzx, xpy - anrmzy, xpz - anrmzz
+    ani521, ani522, ani523 = ypx - anrmzx, ypy - anrmzy, ypz - anrmzz
+    ani531, ani532, ani533 = zpx - anrmzx, zpy - anrmzy, zpz - anrmzz
+    ani611, ani612, ani613 = -(xmx - anrmzx), -(xmy - anrmzy), -(xmz - anrmzz)
+    ani621, ani622, ani623 = -(ymx - anrmzx), -(ymy - anrmzy), -(ymz - anrmzz)
+    ani631, ani632, ani633 = -(zmx - anrmzx), -(zmy - anrmzy), -(zmz - anrmzz)
+    add("A5", ani511, ani522, ani533, ani512, ani523, ani513)
+    add("B5", ani511, ani522, ani533, ani521, ani532, ani531)
+    add("A6", ani611, ani622, ani633, ani612, ani623, ani613)
+    add("B6", ani611, ani622, ani633, ani621, ani632, ani631)
+
+    return tensors
 
 
 def compute_anisotropy_tensor(
@@ -2194,19 +2991,175 @@ def compute_anisotropy_tensor(
     ani021, ani022, ani023 = (ypx - ymx) / 2, (ypy - ymy) / 2, (ypz - ymz) / 2
     ani031, ani032, ani033 = (zpx - zmx) / 2, (zpy - zmy) / 2, (zpz - zmz) / 2
 
-    tensor = AniTensor(
-        id=ech.id, code2="A0",
-        k11=ani011, k22=ani022, k33=ani033,
-        k12=(ani012 + ani021) / 2,
-        k23=(ani032 + ani023) / 2,
-        k13=(ani013 + ani031) / 2,
+    all_tensors = _all_ani_variants(
+        ech.id,
+        xpx, xpy, xpz, xmx, xmy, xmz,
+        ypx, ypy, ypz, ymx, ymy, ymz,
+        zpx, zpy, zpz, zmx, zmy, zmz,
     )
+    tensor = all_tensors[0]  # 'A0', identique a l'ancien calcul direct ci-dessus
     raw = ((ani011, ani012, ani013), (ani021, ani022, ani023), (ani031, ani032, ani033))
     return AnisotropyComputation(
-        tensor=tensor, raw=raw, positions=positions, holder_used=holder is not None,
+        tensor=tensor, all_tensors=all_tensors, raw=raw, positions=positions,
+        holder_used=holder is not None,
         nrm_mean=nrm_mean, position_diags=diags, deviation_pct=deviation_pct,
         swapped_axes=swapped_axes, trm_evolution_pct=trm_evolution_pct, zb_used=zb_used,
     )
+
+
+# Format .pmagani (tabulations, entete de colonnes explicite) - remplace
+# l'ancien format .ANI list-directed Fortran (espaces, sans entete) -
+# demande explicite utilisateur ("can we write the name of the ani
+# extension as .pmagani", "What will be the most complete .pmagani file
+# as a companion to .prmag and pmagres"). cin/caz/dip/str NE SONT PLUS
+# ecrits ici - demande explicite utilisateur ("the codes cin caz dip str
+# are now not needed if the pmagani is linked to the prmag file") : ce
+# sont exactement les memes champs (memes noms) que ceux deja stockes
+# par specimen dans .prmag (voir testlect.Pmag.cin/caz/dip/str_), donc
+# une pure duplication maintenant que .pmagani est systematiquement
+# associe a son .prmag (meme nom de base, jointure par specimen - voir
+# ani_path_for) ; etape est conserve (diagnostic, PAS dans .prmag).
+# n_positions/sigma/ftest/ftest12/ftest23 sont NOUVEAUX - "n.d" si non
+# disponibles (le calcul natif Starmac, jackknife geometrique, ne calcule
+# pas les statistiques de Hext ; seul le chemin PmagPy - voir
+# anisotropy_magic.compute_aarm_pmagpy - les fournit).
+_PMAGANI_HEADER = [
+    "specimen", "code2", "etape",
+    "k11", "k22", "k33", "k12", "k23", "k13", "s(SI*1e-5)",
+    "n_positions", "sigma", "ftest", "ftest12", "ftest23", "quality", "info",
+]
+# `quality` ('g'/'b'/n.d) : verdict PmagPy (Hext F-test, aniso_ftest_
+# quality) persiste comme colonne A PART ENTIERE (pas seulement noye dans
+# le texte libre `info`) - necessaire pour pouvoir le RELIRE de facon
+# fiable (calcul.read_ani_tensor) plutot que de re-parser une phrase en
+# texte libre - demande explicite utilisateur (prompt "inverse anisotropy
+# correction anyway ?" lors de la correction paleointensite, qui a besoin
+# de savoir SANS ambiguite si le tenseur relu depuis le fichier est
+# satisfactory ou non).
+
+# `s` (susceptibilite scalaire) est en SI*1e-5 (ex. 7261 = 0.07261 SI) -
+# convention Bartington ("since the 80s ... measure in 1e-5 SI assuming a
+# volume of 10cc ... could read between 0 and 9999"), gardee par
+# l'utilisateur pour pouvoir comparer Bartington et AGICO - demande
+# explicite utilisateur ("We should add in the header that s is in
+# SI*1e-5"). Ecrite en commentaire d'entete par _ensure_pmagani_header
+# (et cote AMS_Py par import_legacy_ani/import_asc_file).
+_PMAGANI_UNITS_NOTE = "# s(SI*1e-5): susceptibility in units of 1e-5 SI (Bartington/AGICO convention, e.g. 7261 = 0.07261 SI)\n"
+
+
+def _fmt_pmagani_stat(v: Optional[float]) -> str:
+    return "n.d" if v is None else f"{v:.6g}"
+
+
+def _parse_pmagani_stat(v: str) -> Optional[float]:
+    v = v.strip()
+    if not v or v == "n.d":
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        return None
+
+
+def _ensure_pmagani_header(path: str) -> None:
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# pmagani v1 - companion of .prmag/.pmagres, join key = specimen\n")
+            f.write(_PMAGANI_UNITS_NOTE)
+            f.write("\t".join(_PMAGANI_HEADER) + "\n")
+
+
+def _format_pmagani_line(
+    ech: "SelectedSample", tensor: AniTensor, etape: int,
+    zplus_label: str, zminus_label: str, trm_evolution_pct: float, deviation_pct: float,
+) -> str:
+    info_text = (
+        f"TRM evo: {trm_evolution_pct:5.1f} deviation:{deviation_pct:5.1f}"
+        f"  steps: X+ X- Y+ Y- {zplus_label} {zminus_label}"
+    )
+    if tensor.quality == "g":
+        info_text += " - PmagPy Hext F-test: significant anisotropy (satisfactory)"
+    elif tensor.quality == "b":
+        info_text += " - PmagPy Hext F-test: NOT significant (not satisfactory)"
+    info = f'"{info_text}"'
+    n_positions = tensor.n_positions if tensor.n_positions is not None else 6
+    fields = [
+        ech.id, tensor.code2, str(etape),
+        f"{tensor.k11:.6E}", f"{tensor.k22:.6E}", f"{tensor.k33:.6E}",
+        f"{tensor.k12:.6E}", f"{tensor.k23:.6E}", f"{tensor.k13:.6E}",
+        "1.00000", str(n_positions),
+        _fmt_pmagani_stat(tensor.sigma), _fmt_pmagani_stat(tensor.ftest),
+        _fmt_pmagani_stat(tensor.ftest12), _fmt_pmagani_stat(tensor.ftest23),
+        tensor.quality or "n.d",
+        info,
+    ]
+    return "\t".join(fields) + "\n"
+
+
+def _read_pmagani_tensors(path: str) -> List[AniTensor]:
+    """Colonnes : specimen,code2,etape,k11,k22,k33,k12,k23,k13,s,
+    n_positions,sigma,ftest,ftest12,ftest23,quality,info (voir
+    _PMAGANI_HEADER) - PLUS de cin/caz/dip/str (voir commentaire au-dessus
+    de _PMAGANI_HEADER) : ces champs viennent maintenant du .prmag associe
+    (jointure par specimen), pas de ce fichier."""
+    out: List[AniTensor] = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if not parts or parts[0] == "specimen":
+                continue  # ligne d'entete
+            if len(parts) < 9:
+                continue
+            try:
+                k11, k22, k33, k12, k23, k13 = (float(p) for p in parts[3:9])
+            except ValueError:
+                continue
+            n_positions = None
+            if len(parts) > 10:
+                try:
+                    n_positions = int(float(parts[10]))
+                except ValueError:
+                    n_positions = None
+            sigma = _parse_pmagani_stat(parts[11]) if len(parts) > 11 else None
+            ftest = _parse_pmagani_stat(parts[12]) if len(parts) > 12 else None
+            ftest12 = _parse_pmagani_stat(parts[13]) if len(parts) > 13 else None
+            ftest23 = _parse_pmagani_stat(parts[14]) if len(parts) > 14 else None
+            quality = None
+            if len(parts) > 15 and parts[15].strip() in ("g", "b"):
+                quality = parts[15].strip()
+            out.append(AniTensor(
+                id=parts[0], code2=parts[1], k11=k11, k22=k22, k33=k33,
+                k12=k12, k23=k23, k13=k13,
+                n_positions=n_positions, sigma=sigma, ftest=ftest,
+                ftest12=ftest12, ftest23=ftest23, quality=quality,
+            ))
+    return out
+
+
+def _read_ani_tensors_legacy(path: str) -> List[AniTensor]:
+    """Lit un ancien fichier .ANI (format list-directed Fortran, sans
+    entete : `D id cin caz dip str etape code2 k11 k22 k33 k12 k23 k13 s
+    [info]`) - lecture directe seulement (voir read_ani_tensor, dispatch
+    par extension) ; la CONVERSION explicite vers .pmagani se fait
+    desormais cote AMS_Py uniquement (ams_selection.import_legacy_ani) -
+    demande explicite utilisateur ("in starmac_Py, you can delete the
+    import legacy .ANI file, it is better to handle this in AMS_Py")."""
+    out: List[AniTensor] = []
+    with open(path, "r", encoding="iso-8859-1", errors="replace") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 14 or parts[0] != "D":
+                continue
+            try:
+                k11, k22, k33, k12, k23, k13 = (float(p) for p in parts[8:14])
+            except ValueError:
+                continue
+            out.append(AniTensor(id=parts[1], code2=parts[7], k11=k11, k22=k22, k33=k33,
+                                  k12=k12, k23=k23, k13=k13))
+    return out
 
 
 def write_ani_tensor(
@@ -2214,30 +3167,50 @@ def write_ani_tensor(
     positions: Optional[Dict[str, Measurement]] = None,
     trm_evolution_pct: float = 0.0, deviation_pct: float = 0.0,
 ) -> None:
-    """Ajoute une ligne au fichier .ANI (calcul.f:4592-4595/4565-4566,
-    format list-directed Fortran - separateurs espace, relu par
-    `read_ani_tensor` via `line.split()`). L'etape et les labels Z+/Z-
-    (pour le texte informatif) viennent de `positions` (voir
-    AnisotropyComputation.positions - passer ce qui a deja ete detecte
-    evite un second appel a detect_six_positions) ; si non fourni,
-    redetecte depuis `ech`. `trm_evolution_pct`/`deviation_pct` : voir
-    AnisotropyComputation (0.0 par defaut si absents, ex. pas de mesure
-    ZB trouvee)."""
+    """Ajoute une ligne au fichier .pmagani (voir _format_pmagani_line ;
+    format tabule avec entete, relu par `read_ani_tensor`/
+    `_read_pmagani_tensors`). L'etape et les labels Z+/Z- (pour le texte
+    informatif) viennent de `positions` (voir AnisotropyComputation.
+    positions - passer ce qui a deja ete detecte evite un second appel a
+    detect_six_positions) ; si non fourni, redetecte depuis `ech`.
+    `trm_evolution_pct`/`deviation_pct` : voir AnisotropyComputation (0.0
+    par defaut si absents, ex. pas de mesure ZB trouvee). Pour ecrire les
+    15 variantes d'un coup, voir write_ani_tensors."""
     if positions is None:
         positions = detect_six_positions(ech)
     etape = positions["X+"].etape if positions else 0
     zplus_label = positions["Z+"].cod1 + positions["Z+"].cod2 if positions else ""
     zminus_label = positions["Z-"].cod1 + positions["Z-"].cod2 if positions else ""
-    info = (
-        f'"TRM evo: {trm_evolution_pct:5.1f} deviation:{deviation_pct:5.1f}'
-        f'  steps: X+ X- Y+ Y- {zplus_label} {zminus_label}"'
-    )
+    _ensure_pmagani_header(path)
+    line = _format_pmagani_line(ech, tensor, etape, zplus_label, zminus_label, trm_evolution_pct, deviation_pct)
     with open(path, "a", encoding="utf-8") as f:
-        f.write(
-            f"D  {ech.id} {ech.cin} {ech.caz} {ech.dip} {ech.str_} {etape} "
-            f"{tensor.code2} {tensor.k11:.6E} {tensor.k22:.6E} {tensor.k33:.6E} "
-            f"{tensor.k12:.6E} {tensor.k23:.6E} {tensor.k13:.6E} 1.00000 {info}\n"
-        )
+        f.write(line)
+
+
+def write_ani_tensors(
+    path: str, ech: "SelectedSample", tensors: List[AniTensor],
+    positions: Optional[Dict[str, Measurement]] = None,
+    trm_evolution_pct: float = 0.0, deviation_pct: float = 0.0,
+) -> None:
+    """Ecrit UNE ligne par tensor de `tensors` (typiquement les 15
+    variantes de AnisotropyComputation.all_tensors - A0/A+/A-/A1/B1/A2/
+    B2/A3/B3/A4/B4/A5/B5/A6/B6) - demande explicite utilisateur
+    ("implement the 15 outputs for the anisotropy tensor with the A0
+    code being the major one"). Equivalent du Fortran, qui ecrit les 15
+    lignes d'affilee des que l'utilisateur confirme UNE FOIS "save in
+    file .ANI: Y/n" (calcul.f:3038-3255) - meme etape/labels Z+/Z-/info
+    pour toutes (calcules une seule fois, comme dans le Fortran), seul
+    `tensor.code2` change d'une ligne a l'autre."""
+    if positions is None:
+        positions = detect_six_positions(ech)
+    etape = positions["X+"].etape if positions else 0
+    zplus_label = positions["Z+"].cod1 + positions["Z+"].cod2 if positions else ""
+    zminus_label = positions["Z-"].cod1 + positions["Z-"].cod2 if positions else ""
+    _ensure_pmagani_header(path)
+    with open(path, "a", encoding="utf-8") as f:
+        for tensor in tensors:
+            f.write(_format_pmagani_line(
+                ech, tensor, etape, zplus_label, zminus_label, trm_evolution_pct, deviation_pct))
 
 
 # ---------------------------------------------------------------------------
@@ -2301,27 +3274,34 @@ def compute_anicor_factor(
 
 
 def read_ani_tensor(path: str, sample_id: str, code2: str) -> Optional[AniTensor]:
-    """Equivalent de la recherche dans le fichier .ANI de `inverseani`
-    (lecture list-directed Fortran : champs separes par des espaces -
-    truc,id,cin,caz,dip,str,etape,code2,k11,k22,k33,k12,k23,k13,s, 15 champs).
+    """Recherche un tenseur dans un fichier .pmagani (nouveau format
+    tabule, voir _read_pmagani_tensors) OU un ancien .ANI (list-directed
+    Fortran, voir _read_ani_tensors_legacy) - dispatch par EXTENSION, pas
+    par contenu : les deux formats restent lisibles, demande explicite
+    utilisateur ("can we import old style .ANI in these pmagani style").
     VERIFIE contre un vrai fichier .ANI (Miriam_2025b/SanJuan_Pmag.ANI) -
     parsing confirme correct sur des lignes reelles produites par
-    anisoauto (voir compute_anisotropy_tensor)."""
+    anisoauto (voir compute_anisotropy_tensor).
+
+    Comparaison d'id INSENSIBLE A LA CASSE (`.upper()` des deux cotes) -
+    meme convention que PARTOUT ailleurs dans l'appli pour les id de
+    specimen (selection.select_samples/select_samples_by_site/...,
+    toujours `.upper()`) - bug reel confirme sur donnees reelles
+    (Miriam_2026/SanJuan_Pmag) : le .prmag/.pmagres connait le specimen
+    "18A" (majuscule) mais le .pmagani (issu d'un import .ANI ancien)
+    l'a enregistre "18a" (minuscule) - la comparaison exacte precedente
+    ne trouvait donc jamais le tenseur A0 pourtant bien present, et la
+    correction d'anisotropie en paleointensite echouait silencieusement
+    (aucune note, aucune erreur) - demande explicite utilisateur ("la
+    correction d'anisotropie ne se fait pas... test sur sample 18A")."""
     if not os.path.exists(path):
         return None
-    with open(path, "r", encoding="iso-8859-1", errors="replace") as f:
-        for line in f:
-            parts = line.split()
-            if len(parts) < 14:
-                continue
-            if parts[1] != sample_id or parts[7] != code2:
-                continue
-            try:
-                k11, k22, k33, k12, k23, k13 = (float(p) for p in parts[8:14])
-            except ValueError:
-                continue
-            return AniTensor(id=parts[1], code2=parts[7], k11=k11, k22=k22, k33=k33,
-                              k12=k12, k23=k23, k13=k13)
+    ext = os.path.splitext(path)[1].lower()
+    tensors = _read_pmagani_tensors(path) if ext == ".pmagani" else _read_ani_tensors_legacy(path)
+    sample_id_upper = sample_id.upper()
+    for t in tensors:
+        if t.id.upper() == sample_id_upper and t.code2 == code2:
+            return t
     return None
 
 

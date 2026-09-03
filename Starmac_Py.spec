@@ -1,11 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_data_files
+
+# pmagpy ships non-.py data files (IGRF coefficients in field_models/,
+# the MagIC data model in data_model/) that orient_sample.py (IGRF
+# declination) and paleointensity_magic.py depend on at runtime - PyInstaller
+# does not bundle these automatically, only .py modules. Both call sites
+# were added after the previous build (2026-08-22), so this was never
+# exercised in a packaged app before.
+datas = collect_data_files('pmagpy')
 
 a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -21,7 +30,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='Starmac_AWE',
+    name='Starmac_Py',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -40,11 +49,11 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='Starmac_AWE',
+    name='Starmac_Py',
 )
 app = BUNDLE(
     coll,
-    name='Starmac_AWE.app',
+    name='Starmac_Py.app',
     icon=None,
     bundle_identifier=None,
 )

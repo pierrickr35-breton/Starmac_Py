@@ -6,6 +6,7 @@ __pycache__/
 # PyInstaller build artifacts
 build/
 dist/
+Starmac_Py_dev.app/
 
 # macOS
 .DS_Store

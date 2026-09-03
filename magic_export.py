@@ -192,6 +192,8 @@ def _site_mean_row(site: str, results: List[FitResult]) -> Optional[Dict[str, st
             "dir_n_specimens_planes": str(int(r.tx[1])),
             "vgp_lat": _num(r.par4, 1),
             "vgp_lon": _num(r.par5, 1),
+            "vgp_dp": _num(r.vgp_dp, 1) if r.vgp_dp else "",
+            "vgp_dm": _num(r.vgp_dm, 1) if r.vgp_dm else "",
         }
     return None
 
@@ -290,7 +292,7 @@ def build_locations_rows(
 
 _SAMPLES_HEADER = [
     "citations", "sample", "site", "geologic_classes", "lithologies",
-    "geologic_types", "lat", "lon", "timestamp", "orientation_quality",
+    "geologic_types", "lat", "lon", "height", "timestamp", "orientation_quality",
     "azimuth", "dip", "bed_dip_direction", "bed_dip", "method_codes",
 ]
 
@@ -312,9 +314,10 @@ def build_samples_rows(samples: List[SelectedSample]) -> List[List[str]]:
         else:
             method_codes = "SO-POM:SO-SUN"
 
+        height = "" if ech.stratigraphic_height is None else _num(ech.stratigraphic_height, 2)
         row = [
             "This study", sample, ech.magic_site, ech.magic_gc, ech.magic_li,
-            ech.magic_smt, _num(ech.lat), _num(_wrap_lon(ech.rlong)),
+            ech.magic_smt, _num(ech.lat), _num(_wrap_lon(ech.rlong)), height,
             _timestamp(ech), "g", _num(azimuth, 1), _num(-ech.cin, 1),
             _num(_bed_dip_direction(ech.str_, ech.dip), 1), _num(ech.dip, 1),
             method_codes,
@@ -501,8 +504,53 @@ def _instrument(ins: str) -> str:
     return "2 positions"
 
 
+# Anisotropie (cod1 X/Y/Z, 6+ positions +/-) - demande explicite
+# utilisateur ("anisotropy with code X+,Y+,Z+ X-,Y-,Z- is usually done by
+# TRM acquisition and is found in files with paleointensity experiments,
+# but there are some done with high field IRM, in that case, the strong
+# field dc field is the step value... ask the user to confirm the kind of
+# anisotropy experiment when it is dubious? and whether it wants to
+# archive these data") : deux protocoles distincts partagent le meme
+# cod1/cod2 - TRM (chauffe + champ labo, `etape` = temperature en degC,
+# LP-AN-TRM) ou IRM fort champ (`etape` = champ fort en mT, LP-AN-IRM),
+# indiscernables sans contexte. Auto-classifie quand le contexte est
+# fiable, sinon laisse a l'appelant (app.py, seul endroit avec un moyen
+# d'interroger l'utilisateur) le soin de demander - voir
+# ouvrir_export_magic_dialog.
+_ANISOTROPY_AXIS_COD1 = ("X", "Y", "Z")
+_PALEOINT_COMPANION_COD1 = {"R", "V", "P", "S"}
+_MAX_PLAUSIBLE_TEMP_C = 700.0  # au-dela, ne peut plus etre une temperature de chauffe usuelle
+
+
+def classify_anisotropy_experiment(mesures: List[Measurement]) -> Optional[str]:
+    """'trm' ou 'irm' si le contexte permet une classification fiable,
+    None si DOUTEUX (l'appelant doit demander a l'utilisateur) - pour
+    l'ENSEMBLE des pas d'anisotropie (cod1 X/Y/Z) d'un specimen :
+    - 'trm' des qu'un pas de paleointensite genuine (R/V/P/S, un vrai
+      protocole Thellier/IZZI sur CE specimen) est present - "found in
+      files with paleointensity experiments".
+    - 'irm' des qu'un `etape` d'un pas X/Y/Z depasse
+      _MAX_PLAUSIBLE_TEMP_C (ne peut physiquement pas etre une
+      temperature de chauffe - "the strong field dc field is the step
+      value", un champ fort typique en mT depasse largement 700).
+    - None (douteux) sinon - ex. `etape` dans une plage plausible pour
+      les DEUX interpretations (temperature ordinaire OU champ IRM
+      modere) sans compagnon paleointensite pour trancher. Verifie sur
+      donnees reelles (Tibet_14_15_Pmag.txt) : plusieurs specimens
+      genuinement ambigus (etape=520/510/150 sans R/V/P/S, ou etape=1100
+      sans aucune ambiguite - largement au-dela de 700)."""
+    axis_steps = [m for m in mesures if m.cod1 in _ANISOTROPY_AXIS_COD1]
+    if not axis_steps:
+        return None
+    if any(m.cod1 in _PALEOINT_COMPANION_COD1 for m in mesures):
+        return "trm"
+    if any(m.etape > _MAX_PLAUSIBLE_TEMP_C for m in axis_steps):
+        return "irm"
+    return None
+
+
 def _measurement_treatment(
-    m: Measurement, prev: List[Measurement], ifield: float,
+    m: Measurement, prev: List[Measurement], ifield: float, anisotropy_kind: str = "trm",
 ) -> Tuple[str, float, float, float, float, float]:
     """Equivalent du `select case (mes(j).cod1)` de export2magic (voir §4
     du rapport d'exploration) : retourne (method_codes, treat_temp,
@@ -546,25 +594,49 @@ def _measurement_treatment(
         dc_field = etape * 0.001
         codes = "LT-IRM"
     elif m.cod1 == "F":
-        # Demande explicite utilisateur ("during import F= just put
-        # LT-AF-Z ; we do not know the detail. FT add the code for AF
-        # tumbler") : l'axe/ordre exact ('-'/'+'/'X'/'Y'/'Z' sur cod2)
-        # n'est pas fiable ni verifiable ici - "LT-AF-Z-XZY"/"-YZX"/"-X"/
-        # "-Y"/"-Z" (version precedente) ne sont PAS des codes MagIC
-        # reels (verifie contre data_model/method_codes.json de pmagpy :
-        # absents du vocabulaire controle), retires. cod2=='T' (tumbler,
-        # cf datatools.eliminate_grm/convert_thellier_to_nrm) reste le
-        # seul cas ou le detail est effectivement connu et correspond a
-        # un code MagIC reel, LT-AF-Z-TUMB ("using a tumbling AF
-        # demagnetizer") - deduit du cod2 de LA MESURE, plus d'un
-        # parametre global af_mode choisi une fois pour tout l'export.
+        # Demande explicite utilisateur, en plusieurs temps :
+        # 1) "during import F= just put LT-AF-Z ; we do not know the
+        #    detail. FT add the code for AF tumbler".
+        # 2) "all AF demagnetization were done [with] the 3 axis
+        #    degausser if the instrument is C as the degausser is online
+        #    with the magnetometer ; best to add the complement of the
+        #    Magic code as defined before, especially for the FX,FY,FZ.
+        #    For the other instrument, the AF degausser was a tumbler." -
+        #    verifie sur donnees reelles (old_pmag.ren) : cod2 en 'X'/'Y'/
+        #    'Z' pour cod1='F' n'apparait QUE pour l'instrument "C1"
+        #    (32/32/46 occurrences), jamais pour "Mo"/"J2"/"S".
+        # 3) CORRECTION IMPORTANTE (l'utilisateur les a lui-meme
+        #    introduits dans le vocabulaire MagIC officiel - "it is
+        #    official MagIC vocabulary? I introduce it to Magic!") :
+        #    "LT-AF-Z-X"/"-Y"/"-Z" SONT des codes MagIC reels, verifie en
+        #    RE-INTERROGEANT le vocabulaire EN LIGNE
+        #    (https://www2.earthref.org/MagIC/method-codes.json, meme
+        #    source que controlled_vocabularies3.py) plutot que le fichier
+        #    LOCAL/PERIME embarque avec pmagpy 4.5.2
+        #    (pmagpy/data_model/method_codes.json, qui ne les contient
+        #    pas) - la premiere verification etait donc fausse (base sur
+        #    une copie obsolete). Le vocabulaire en ligne contient aussi
+        #    "LT-AF-Z-XZY"/"-YZX"/"-XYZ"/"-YXZ"/"-ZXY"/"-ZYX" (sequence
+        #    complete des 3 axes, un code par ordre) - confirme par
+        #    l'utilisateur : sur l'instrument "C1", cod2='+' correspond a
+        #    la sequence Y,Z,X (LT-AF-Z-YZX) et cod2='-' a X,Z,Y
+        #    (LT-AF-Z-XZY) - la tres large majorite des pas AF au C1 (cod2
+        #    '+'/'-', ~4750 sur ~4780) portent donc CETTE information,
+        #    X/Y/Z (un seul axe) restant l'exception rare.
         af_field = etape * 0.0001
+        ins = (m.ins or "").strip().upper()
         if etape == 0:
             codes = "LT-NO"
-        elif m.cod2 == "T":
-            codes = "LT-AF-Z:LT-AF-Z-TUMB"
+        elif ins.startswith("C"):
+            codes = {
+                "X": "LT-AF-Z:LT-AF-Z-X", "Y": "LT-AF-Z:LT-AF-Z-Y", "Z": "LT-AF-Z:LT-AF-Z-Z",
+                "+": "LT-AF-Z:LT-AF-Z-YZX", "-": "LT-AF-Z:LT-AF-Z-XZY",
+            }.get(m.cod2, "LT-AF-Z")
         else:
-            codes = "LT-AF-Z"
+            # Tout instrument hors "C*" : degausser tumbler (mecanique,
+            # hors ligne) pour TOUT pas AF, quel que soit cod2 - un
+            # tumbler n'a pas de notion d'ordre X/Y/Z discret.
+            codes = "LT-AF-Z:LT-AF-Z-TUMB"
     elif m.cod1 == "N":
         temp = etape + 273
         codes = "LT-NO"
@@ -615,13 +687,29 @@ def _measurement_treatment(
             dc_field = ifield * 1.0e-6
             codes = "LT-PTRM-I:LP-PI-TRM:LP-PI-II:LP-PI-ALT"
         elif prev and prev[-1].cod1 == "R":
+            # BUG CORRIGE (signale par l'utilisateur - "there is two ways
+            # of doing this ... the second way is to do a PTRM check after
+            # a R step, and then you do it in zero field") : ce controle
+            # suit un pas 'R' (en champ) et est refait EN CHAMP NUL - c'est
+            # le "pTRM tail check a temperature plus basse" officiel MagIC
+            # LT-PTRM-Z ("After in laboratory field step, perform a zero
+            # field cooling at a lower temperature", verifie sur le
+            # vocabulaire en ligne, cf. www2.earthref.org/MagIC/method-
+            # codes.json), PAS LT-PTRM-I ("After zero field step, perform
+            # an in field cooling" - c'est l'AUTRE sens, tague dans le
+            # `else` ci-dessous) : coder les deux LT-PTRM-I ici les
+            # confondait dans `pmag.sortarai`, qui les repartit dans deux
+            # listes DISTINCTES (ptrm_check vs zptrm_check) utilisees de
+            # facon exclusive par PintPars pour DRAT/DRATS - un controle en
+            # champ nul mal etiquete LT-PTRM-I y etait traite comme si son
+            # propre moment (mesure SANS champ) etait un pTRM re-acquis,
+            # faussant le calcul.
             dc_field = 0.0
-            codes = "LT-PTRM-I:LP-PI-TRM:LP-PI-ALT-PTRM:LP-PI-BT-IZZI"
+            codes = "LT-PTRM-Z:LP-PI-TRM:LP-PI-ALT-PTRM:LP-PI-BT-IZZI"
         else:
             dc_field = ifield * 1.0e-6
             codes = "LT-PTRM-I:LP-PI-TRM:LP-PI-ALT-PTRM:LP-PI-BT-IZZI"
     elif m.cod1 in ("X", "Y", "Z"):
-        temp = etape + 273
         theta = 90.0 if m.cod1 == "Z" else 0.0
         if m.cod1 == "X":
             phi = 180.0 if m.cod2 == "-" else 0.0
@@ -634,7 +722,18 @@ def _measurement_treatment(
         # inverse) EXIGE deja "LP-AN-TRM" pour reconnaitre un pas ATRM a
         # l'import MagIC (voir _experiment_signature/_atrm_axis_sign) -
         # asymetrie corrigee ici, cote export/conversion.
-        codes = "LT-T-I:LP-AN-TRM"
+        #
+        # LP-AN-IRM (anisotropie d'IRM fort champ) AJOUTE ici - demande
+        # explicite utilisateur (voir classify_anisotropy_experiment) :
+        # `etape` represente alors un champ fort (mT), pas une
+        # temperature - meme convention que cod1='I' (dc_field=etape*
+        # 1e-3), PAS de treat_temp (contrairement au cas TRM).
+        if anisotropy_kind == "irm":
+            dc_field = etape * 0.001
+            codes = "LT-IRM:LP-AN-IRM"
+        else:
+            temp = etape + 273
+            codes = "LT-T-I:LP-AN-TRM"
     elif m.cod1 in ("L", "Q"):
         temp = etape + 273
         theta = 90.0
@@ -684,7 +783,17 @@ def _izzi_order_tags(mesures: List[Measurement]) -> Dict[int, str]:
 
 def build_measurements_rows(
     samples: List[SelectedSample], lab_analysts: str,
+    anisotropy_kind_by_specimen: Optional[Dict[str, str]] = None,
+    anisotropy_skip: Optional[set] = None,
 ) -> List[List[str]]:
+    """`anisotropy_kind_by_specimen` ("trm"/"irm") et `anisotropy_skip`
+    (id specimen -> ne pas archiver les pas X/Y/Z d'anisotropie) resolvent
+    l'ambiguite TRM/IRM signalee par l'utilisateur pour les pas cod1 in
+    (X,Y,Z) - voir classify_anisotropy_experiment. Un specimen absent de
+    `anisotropy_kind_by_specimen` est traite en "trm" (comportement
+    historique inchange)."""
+    anisotropy_kind_by_specimen = anisotropy_kind_by_specimen or {}
+    anisotropy_skip = anisotropy_skip or set()
     rows = []
     counter = 0
     for ech in samples:
@@ -693,8 +802,12 @@ def build_measurements_rows(
         except (ValueError, TypeError):
             ifield = 0.0
         izzi_tags = _izzi_order_tags(ech.mesures)
+        skip_anisotropy = ech.id in anisotropy_skip
+        anisotropy_kind = anisotropy_kind_by_specimen.get(ech.id, "trm")
 
         for j, m in enumerate(ech.mesures):
+            if skip_anisotropy and m.cod1 in ("X", "Y", "Z"):
+                continue
             counter += 1
             mag, dec, inc = polere(m.x, m.y, m.z)
             if ech.norme == "m":
@@ -709,7 +822,7 @@ def build_measurements_rows(
                 chi_mass = ""
 
             codes, temp, af_field, dc_field, phi, theta = _measurement_treatment(
-                m, ech.mesures[:j], ifield)
+                m, ech.mesures[:j], ifield, anisotropy_kind)
             if j in izzi_tags:
                 parts = [p for p in codes.split(":") if p not in ("LP-PI-TRM-IZ", "LP-PI-TRM-ZI")]
                 parts.append(izzi_tags[j])
@@ -776,6 +889,8 @@ def export_to_magic(
     out_dir: str,
     lab_analysts: str = "",
     continent_ocean: str = "", country: str = "", region: str = "",
+    anisotropy_kind_by_specimen: Optional[Dict[str, str]] = None,
+    anisotropy_skip: Optional[set] = None,
 ) -> MagicExportResult:
     """Equivalent (mode classique, ichoixexport==1) de `export2magic`.
     `samples` est trie par (magic_site, magic_sample, id) avant traitement
@@ -791,7 +906,8 @@ def export_to_magic(
     locations_rows = build_locations_rows(ordered, continent_ocean, country, region)
     samples_rows = build_samples_rows(ordered)
     specimens_rows = build_specimens_rows(ordered, results)
-    measurements_rows = build_measurements_rows(ordered, lab_analysts)
+    measurements_rows = build_measurements_rows(
+        ordered, lab_analysts, anisotropy_kind_by_specimen, anisotropy_skip)
 
     files = [
         ("sites.txt", "sites", _SITES_HEADER, sites_rows),

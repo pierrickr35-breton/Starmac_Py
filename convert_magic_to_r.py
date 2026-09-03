@@ -37,9 +37,12 @@ import os
 import re
 from typing import Dict, List, Optional, Tuple
 
-from extract_magic import _OUT_OF_SCOPE_PROTOCOLS, magic_results_to_redo_lines, magic_site_means
+from extract_magic import (
+    _OUT_OF_SCOPE_PROTOCOLS, magic_results_to_redo_lines, magic_site_means,
+    magic_pint_results_to_redo_lines,
+)
 from testlect import read_prmag_file
-from calcul import FitResult, archivres, fit_from_redo_file, results_path_for
+from calcul import FitResult, archivres, fit_from_redo_file, results_path_for, dp_dm_from_a95
 
 FORMAT_HEADER = (
     "#Starmac .prmag v1  angles=deg  fields in milliTesla (mT) for strong "
@@ -59,7 +62,19 @@ _MEAS_HEADER = (
 def parse_magic_contribution(path: str) -> Dict[str, List[Dict[str, str]]]:
     """Coupe le fichier combine en tables sur les marqueurs
     "tab delimited\\t<nom>", lit chaque table (ligne d'en-tete + lignes de
-    donnees) en liste de dict {colonne: valeur}."""
+    donnees) en liste de dict {colonne: valeur}.
+
+    Chaque table (sauf la derniere du fichier) se termine par une ligne
+    ">>>>>>>>>>" - marqueur de fin de table du format "contribution
+    combinee" MagIC reel (verifie sur magic_contribution_19491.txt :
+    present a l'identique apres locations/sites/samples/specimens/
+    measurements/criteria, absent seulement apres la derniere table -
+    "ages" - qui s'arrete a la fin du fichier). Bug reel corrige, signale
+    par l'utilisateur ("à la fin de l'importation d'une contribution
+    Magic, il y a une ligne supplémentaire") : ce marqueur n'etait pas
+    filtre et se retrouvait traite comme une derniere ligne de DONNEES de
+    la table measurements, produisant un "specimen" fantome (id vide, 1
+    mesure bidon) dans le .prmag converti."""
     tables: Dict[str, List[Dict[str, str]]] = {}
     with open(path, "r", encoding="utf-8") as f:
         raw = f.read()
@@ -68,7 +83,7 @@ def parse_magic_contribution(path: str) -> Dict[str, List[Dict[str, str]]]:
     for i in range(1, len(blocks), 2):
         name = blocks[i]
         body = blocks[i + 1].strip("\n")
-        lines = body.split("\n")
+        lines = [l for l in body.split("\n") if l.strip() != ">>>>>>>>>>"]
         if not lines or not lines[0]:
             tables[name] = []
             continue
@@ -101,6 +116,38 @@ def _f(row: Dict[str, str], key: str) -> Optional[float]:
 def _s(row: Dict[str, str], key: str) -> str:
     v = (row or {}).get(key, "")
     return v.strip() if v else "n.d"
+
+
+def _temp_k(row: Dict[str, str]) -> Optional[float]:
+    """Temperature (K) du palier - `treat_temp` (cible du TRAITEMENT) en
+    priorite, repli sur `meas_temp` (temperature REELLE de la MESURE,
+    "Room temperature is 293" selon le data model MagIC 3 - verifie en
+    ligne, earthref.org/MagIC/data-models/3.0.json) pour les fichiers NON
+    CONVENTIONNELS ou treat_temp est absent mais le contributeur a
+    neanmoins enregistre la vraie temperature de palier dans meas_temp -
+    demande explicite utilisateur ("use these meas_field_ac meas_temp for
+    AF and thermal to import the step and code in unconventional
+    files"). Sans effet sur un fichier bien forme (treat_temp deja
+    present, meas_temp jamais consulte)."""
+    v = _f(row, "treat_temp")
+    return v if v is not None else _f(row, "meas_temp")
+
+
+def _ac_field_t(row: Dict[str, str]) -> Optional[float]:
+    """Champ AF (Tesla) du palier - `treat_ac_field` (cible du TRAITEMENT)
+    en priorite, repli sur `meas_field_ac` (champ REELLEMENT applique
+    pendant la MESURE) pour les fichiers non conventionnels - MEME
+    logique que `_temp_k`. -1 y est une valeur SENTINELLE ("ambient
+    field", pas une vraie mesure de palier - verifie sur le data model
+    MagIC 3 en ligne, "No field equals 0 and ambient field equals -1") :
+    jamais recuperee comme un palier reel."""
+    v = _f(row, "treat_ac_field")
+    if v is not None:
+        return v
+    v2 = _f(row, "meas_field_ac")
+    if v2 is None or v2 < 0:
+        return None
+    return v2
 
 
 def _nd(value, fmt: Optional[str] = None) -> str:
@@ -150,6 +197,13 @@ def _sample_header_block(specimen: str, spec_row, sample_row, site_row, loc_row)
     bed_dip_direction = _f(sample_row, "bed_dip_direction")
     bed_dip_strike = (bed_dip_direction - 90.0) % 360.0 if bed_dip_direction is not None else None
     bed_dip = _f(sample_row, "bed_dip")
+    # `samples.height` (MagIC data model, "Stratigraphic Height", metres,
+    # positif vers le haut - verifie dans pmagpy/data_model/
+    # data_model.json) - demande explicite utilisateur ("add an
+    # additional variable: stratigraphic_position (or the Magic
+    # equivalent)"), reprend directement le nom/l'unite MagIC plutot
+    # qu'un nom invente.
+    stratigraphic_height = _f(sample_row, "height") if sample_row else None
 
     formation = _s(site_row, "formation") if site_row else "n.d"
     age_low = _f(site_row, "age_low")
@@ -192,6 +246,7 @@ def _sample_header_block(specimen: str, spec_row, sample_row, site_row, loc_row)
         f"specimen: {specimen}\tsample: {sample_name}\tsite: {site_name}\t"
         f"volume: {volume_field}\tmass: {mass_field}\t"
         f"lat: {_nd(lat, '.5f')}\tlon: {_nd(lon, '.5f')}\televation: {_nd(elevation, '.1f')}\t"
+        f"stratigraphic_height: {_nd(stratigraphic_height, '.2f')}\t"
         f"comment: n.d"
     )
     line_b = (
@@ -313,7 +368,7 @@ def _derive_cod(row: Dict[str, str], letters: Dict[int, str], prev_cod2: str):
     cours) le controle a ete fait, pas quelle temperature il verifie
     (deja portee par `step`)."""
     codes = row.get("method_codes", "")
-    temp = row.get("treat_temp", "")
+    temp = _temp_k(row)
     letter = letters.get(id(row), "")
 
     if "LP-AN-TRM" in codes:
@@ -322,27 +377,63 @@ def _derive_cod(row: Dict[str, str], letters: Dict[int, str], prev_cod2: str):
         # +/- derives du phi/theta DE CETTE LIGNE (main step ou controle
         # pTRM, meme regle - voir _atrm_axis_sign).
         if "LT-T-Z" in codes:
-            return "D", "0", (float(temp) - 273.0) if temp else 0.0
+            return "D", "0", (temp - 273.0) if temp is not None else 0.0
         axis, sign = _atrm_axis_sign(_f(row, "treat_dc_field_phi"), _f(row, "treat_dc_field_theta"))
-        return axis, sign, (float(temp) - 273.0) if temp else 0.0
+        return axis, sign, (temp - 273.0) if temp is not None else 0.0
 
     if "LT-NO" in codes:
         return "N", "0", 0.0
     if "LT-T-Z" in codes:
         if "LP-PI-" in codes:
-            return "S", letter or "0", (float(temp) - 273.0) if temp else 0.0
+            return "S", letter or "0", (temp - 273.0) if temp is not None else 0.0
         # demag thermique directionnel simple (ex. LP-DIR-T) : pas de
         # paleointensite, pas de paire Z/I -> 'D' sans lettre - demande
         # explicite utilisateur ("do not use S for thermal demag").
-        return "D", "0", (float(temp) - 273.0) if temp else 0.0
+        return "D", "0", (temp - 273.0) if temp is not None else 0.0
     if "LT-T-I" in codes:
-        return "R", letter or "0", (float(temp) - 273.0) if temp else 0.0
-    if "LT-PTRM-I" in codes:
-        return "P", prev_cod2 or "0", (float(temp) - 273.0) if temp else 0.0
+        if "LP-PI-II" in codes:
+            # BUG CORRIGE (signale par l'utilisateur - "there is still a
+            # problem in the calculation of the PTRM check") : LP-PI-II
+            # ("Original Thellier-Thellier method", verifie sur le
+            # vocabulaire en ligne) est le protocole "champ en Z puis Z-"
+            # (deja documente/gere cote paleointensity_magic.py,
+            # build_magic_dataframe - "there is no choice than (R+V)/2",
+            # confirme utilisateur sur le specimen "02B") : DEUX mesures
+            # EN CHAMP par etape, orientations opposees (theta=+90 puis
+            # -90), PAS de pas zero-field distinct (aucun LT-T-Z dans la
+            # source, verifie sur magic_contribution_19987.txt,
+            # kr01_02B3). Avant ce fix, les DEUX mesures d'un meme etape
+            # recevaient cod1='R' (le code ne distinguait jamais Z+ de
+            # Z-), produisant deux lignes cod1/cod2/etape IDENTIQUES -
+            # aucune n'etait alors reconnaissable comme 'V', donc le
+            # mecanisme (R+V)/2 de build_magic_dataframe ne se declenchait
+            # JAMAIS et `pmag.sortarai` ne trouvait aucun pas zero-field
+            # (echec total : "not enough IZZI/Thellier steps found (1)").
+            # Ici : theta=+90 (Z+, la reference) -> 'R', theta=-90 (Z-) ->
+            # 'V' - meme convention que magic_export.py (sens export) et
+            # build_magic_dataframe (sens analyse).
+            theta = _f(row, "treat_dc_field_theta")
+            cod1 = "V" if (theta is not None and theta < 0) else "R"
+            return cod1, letter or "0", (temp - 273.0) if temp is not None else 0.0
+        return "R", letter or "0", (temp - 273.0) if temp is not None else 0.0
+    if "LT-PTRM-I" in codes or "LT-PTRM-Z" in codes:
+        # LT-PTRM-I ("after zero field step, in field cooling", controle
+        # classique) et LT-PTRM-Z ("after in-field step, zero field
+        # cooling at a lower temperature", pTRM tail check a temperature
+        # plus basse) sont TOUS LES DEUX un pas 'P' cote Rennes - le
+        # format natif Starmac ne distingue pas les deux variantes par
+        # cod1 (voir magic_export.py cod1=='P', qui les distingue plutot
+        # via dc_field selon que le pas precedent est 'S' ou 'R' - demande
+        # explicite utilisateur, "there is two ways of doing this ...").
+        # Confondre les deux ici (avant ce fix, LT-PTRM-Z tombait dans le
+        # cod1='?' non reconnu ci-dessous) romprait l'import de donnees
+        # IZZI reelles telechargees depuis MagIC utilisant le controle en
+        # champ nul.
+        return "P", prev_cod2 or "0", (temp - 273.0) if temp is not None else 0.0
     if "LT-PTRM-MD" in codes:
         # pTRM-tail check (MD = multidomain tail check, protocole IZZI) -
         # aucun code Rennes existant pour ce pas, 'M' invente ici.
-        return "M", prev_cod2 or "0", (float(temp) - 273.0) if temp else 0.0
+        return "M", prev_cod2 or "0", (temp - 273.0) if temp is not None else 0.0
     if "LT-M-Z" in codes:
         # Paleointensite micro-onde (LP-PI-M) : meme mecanique IZZI que
         # LT-T-Z/LT-T-I/LT-PTRM-I (zero-field/in-field/controle), reprend
@@ -359,16 +450,37 @@ def _derive_cod(row: Dict[str, str], letters: Dict[int, str], prev_cod2: str):
         mw = _f(row, "treat_mw_integral")
         return "P", prev_cod2 or "0", mw if mw is not None else 0.0
     if "LT-AF-Z" in codes:
-        af = _f(row, "treat_ac_field")
+        af = _ac_field_t(row)
         return "F", "0", (af * 1.0e3 if af else 0.0)
     if "LT-AF-I" in codes:
-        af = _f(row, "treat_ac_field")
+        af = _ac_field_t(row)
         return "A", "0", (af * 1.0e3 if af else 0.0)
     if "LT-IRM" in codes:
         dc = _f(row, "treat_dc_field")
         return "I", "0", (dc * 1.0e3 if dc else 0.0)
+    # BUG UTILISATEUR REEL dans certaines contributions MagIC (signale par
+    # l'utilisateur - "in some Magic contribution, the users did not
+    # write well the code, they use LP instead of LT") : LP-DIR-T/
+    # LP-DIR-AF sont des codes de PROTOCOLE (niveau experience -
+    # "Directional data: Step-wise thermal/AF demagnetization", verifie
+    # sur le vocabulaire MagIC en ligne), PAS des codes de TRAITEMENT PAR
+    # PALIER (LT-T-Z/LT-AF-Z) - certains contributeurs les posent quand
+    # meme SEULS sur chaque ligne de mesure, sans jamais indiquer le bon
+    # LT-. Repli, UNIQUEMENT si aucun LT- reconnu ci-dessus n'a matche :
+    # deduire tout de meme le type de demagnetisation plutot que de
+    # laisser tomber ces pas en cod1='?' (jamais exploitable ensuite,
+    # Zijderveld/ajuslig les ignorent). LP-DIR-T/LP-DIR-AF designent PAR
+    # DEFINITION une demagnetisation directionnelle simple, donc TOUJOURS
+    # en champ nul (comme LT-T-Z/LT-AF-Z, jamais LT-T-I/LT-AF-I - aucune
+    # ambiguite possible ici).
+    if "LP-DIR-T" in codes and temp is not None:
+        return "D", "0", temp - 273.0
+    if "LP-DIR-AF" in codes:
+        af = _ac_field_t(row)
+        if af is not None:
+            return "F", "0", af * 1.0e3
     # non reconnu : conserve quand meme la temperature si presente
-    return "?", "0", (float(temp) - 273.0) if temp else 0.0
+    return "?", "0", (temp - 273.0) if temp is not None else 0.0
 
 
 _DC_LOWFIELD_COD1 = {"R", "P", "X", "Y", "Z"}
@@ -410,7 +522,15 @@ def _measurement_rows(specimen: str, meas_rows: List[Dict[str, str]], problems: 
             if x is None:
                 x, y, z = _f(row, "magn_x"), _f(row, "magn_y"), _f(row, "magn_z")
 
-            af = _f(row, "treat_ac_field")
+            # _ac_field_t/_temp_k (repli meas_field_ac/meas_temp pour les
+            # fichiers non conventionnels, voir leur docstring) reutilises
+            # ICI AUSSI - pas seulement dans _derive_cod - pour que les
+            # colonnes treat_ac_field/treat_temp ECRITES dans le .r
+            # restent coherentes avec le cod1/etape deja derive plus haut
+            # (sinon un pas recupere via meas_temp afficherait un etape
+            # correct mais une colonne treat_temp vide/a 0, incoherence
+            # visible dans le fichier converti).
+            af = _ac_field_t(row)
             dc = _f(row, "treat_dc_field")
             af_mT = af * 1.0e3 if (af and cod1 in ("A", "F")) else None
             dc_strong = dc * 1.0e3 if (dc and cod1 == "I") else None
@@ -418,7 +538,7 @@ def _measurement_rows(specimen: str, meas_rows: List[Dict[str, str]], problems: 
 
             phi = _f(row, "treat_dc_field_phi")
             theta = _f(row, "treat_dc_field_theta")
-            temp = _f(row, "treat_temp")
+            temp = _temp_k(row)
             temp_c = (temp - 273.0) if temp is not None else 0.0
 
             ins_full = _s(row, "instrument_codes")
@@ -449,7 +569,7 @@ def _measurement_rows(specimen: str, meas_rows: List[Dict[str, str]], problems: 
     return rows
 
 
-def convert_magic_file(path_in: str, path_out: str) -> Tuple[int, str, int, int]:
+def convert_magic_file(path_in: str, path_out: str) -> Tuple[int, str, int, int, int, Optional[str]]:
     tables = parse_magic_contribution(path_in)
     locations = _index_by(tables.get("locations", []), "location")
     sites = _index_by(tables.get("sites", []), "site")
@@ -488,7 +608,33 @@ def convert_magic_file(path_in: str, path_out: str) -> Tuple[int, str, int, int]
 
     report = format_problems_report(path_in, problems)
     nb_results, nb_means = _convert_magic_results(path_in, path_out)
-    return len(blocks), report, nb_results, nb_means
+    nb_pint, redo_pint_path = _write_pint_redo_file(path_in, path_out)
+    return len(blocks), report, nb_results, nb_means, nb_pint, redo_pint_path
+
+
+def _write_pint_redo_file(path_in: str, path_out: str) -> Tuple[int, Optional[str]]:
+    """Ecrit un fichier "redo_pint_contribution_NUM.txt" (une ligne
+    "specimen tmin tmax" par determination, voir
+    magic_pint_results_to_redo_lines) a cote de `path_out`, directement
+    utilisable par "View Paleoint Results..." (ouvrir_openfilepint_dialog)
+    - demande explicite utilisateur ("during import of Magic paleoint
+    data, can you write a redo_pint_contribution_num.txt file with the
+    specimen number and step1 and step2 found in specimens.txt file. This
+    redo file can be used in view Paleointensity data"). NUM est le
+    numero de contribution extrait du nom du fichier source
+    (magic_contribution_NUM.txt, cf. .gitignore) ; a defaut (fichier
+    renomme), reprend le nom de base de `path_out`. Retourne (0, None)
+    sans creer de fichier si aucune ligne exploitable (specimens.txt
+    absent, ou aucune determination LP-PI-TRM de qualite 'g')."""
+    lines = magic_pint_results_to_redo_lines(path_in, combined=True)
+    if not lines:
+        return 0, None
+    match = re.search(r"magic_contribution_(\w+)", os.path.basename(path_in))
+    num = match.group(1) if match else os.path.splitext(os.path.basename(path_out))[0]
+    redo_path = os.path.join(os.path.dirname(path_out) or ".", f"redo_pint_contribution_{num}.txt")
+    with open(redo_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return len(lines), redo_path
 
 
 def _convert_magic_results(path_in: str, path_out: str) -> Tuple[int, int]:
@@ -543,12 +689,29 @@ def _convert_magic_results(path_in: str, path_out: str) -> Tuple[int, int]:
     site_rows = magic_site_means(path_in, combined=True)
     for row in (site_rows or []):
         cs = [specimen_fits[s].c for s in row["specimens"] if s in specimen_fits]
+        # Ovale de confiance du VGP (dp/dm) - demande explicite utilisateur
+        # ("during the archive of the mean direction in pmagres, the VGP
+        # is calculated. Is it possible to add the dp dm ellipse of
+        # confidence derived from the a95, available in Stereo_Py") :
+        # reprend dp/dm PUBLIES par la contribution MagIC elle-meme s'ils
+        # existent (plus fiable, ex. issu d'un bootstrap - voir
+        # magic_site_means), sinon les derive de alpha95/inc (verifie
+        # contre un exemple reel publiant les deux, calcul.dp_dm_from_a95).
+        if row["vgp_dp"] or row["vgp_dm"]:
+            vgp_dp, vgp_dm = row["vgp_dp"], row["vgp_dm"]
+        else:
+            vgp_dp, vgp_dm = dp_dm_from_a95(row["alpha95"], row["inc"])
         mean_fit = FitResult(
             id=f"mean: {row['site']}", cat1="F", cat2="i",
             nb=row["n"], dec=row["dec"], inc=row["inc"], mad=row["alpha95"],
             tx=(row["k"], 0.0), par3_mean=row["orientation"],
             lat=row["lat"], rlong=row["lon"],
             par4=row["vgp_lat"], par5=row["vgp_lon"],
+            vgp_dp=vgp_dp, vgp_dm=vgp_dm,
+            # Etiquette de composante de magnetisation (dir_comp_name,
+            # "A" par defaut) - voir calcul.FitResult.component et
+            # extract_magic.magic_site_means.
+            component=row["component"],
             liste="codes:" + ":".join(str(c) for c in cs),
         )
         _, existing_ids = archivres(mean_fit, path_results, existing_ids)
@@ -583,7 +746,9 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output")
     args = parser.parse_args()
     out = args.output or os.path.splitext(args.magic_file)[0] + ".prmag"
-    n, report, nb_results, nb_means = convert_magic_file(args.magic_file, out)
+    n, report, nb_results, nb_means, nb_pint, redo_pint_path = convert_magic_file(args.magic_file, out)
     print(report)
     print(f"{n} specimen(s) converted -> {out}")
     print(f"{nb_results} result(s) and {nb_means} site mean(s) -> {results_path_for(out)}")
+    if redo_pint_path:
+        print(f"{nb_pint} paleointensity determination(s) -> {redo_pint_path}")

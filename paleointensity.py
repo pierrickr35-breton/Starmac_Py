@@ -56,6 +56,7 @@ stereo.py).
 """
 
 import math
+import os
 from dataclasses import dataclass, field, replace as _dc_replace
 from typing import List, Optional, Tuple
 
@@ -64,7 +65,7 @@ from matplotlib.figure import Figure
 
 from selection import SelectedSample, Measurement, apply_orientation, polere
 from plotlib import PlotContext
-from calcul import linear_fit
+from calcul import linear_fit, AniTensor, inverse_symmetric_3x3
 from zijderveld import draw_zijderveld
 from stereo import draw_stereo_net, superc
 
@@ -287,6 +288,30 @@ def _compute_arai_coe(
             continue
 
         if cod1 == "P":
+            # DEUX slots DIFFERENTS sont en jeu ici, a ne pas confondre
+            # (bug corrige dans une passe precedente de ce fix, qui les
+            # avait fusionnes en un seul) :
+            # - `k` (slot d'ATTACHE du controle sur le trace) = le pas
+            #   COURANT/recent ou le controle a ete PHYSIQUEMENT effectue
+            #   (cod2 copie de la ligne precedente - voir
+            #   datatools.remove_step / plotpaleoint2.f:1974,
+            #   `mes(i).cod2=mes(i-1).cod2`). Le trace (`draw_arai`,
+            #   `checks_by_k`) et le listing (app.py) rattachent le
+            #   controle a CE point - demande explicite utilisateur ("a
+            #   PTRM at 560 done at step 580, the line should start at
+            #   580"). C'est fidele au Fortran authentique (plotpaleoint2.f
+            #   899-915 : `xt(k,j)` est indexe par le slot COURANT de la
+            #   boucle de trace, PAS par l'etape cible).
+            # - l'etape CIBLE (`mesures[i].etape`, deja stockee dans
+            #   `check.temp` via `_step_of`) sert UNIQUEMENT a retrouver le
+            #   bon 'S'/'R' pour calculer xtptrm/xt (voir plus bas) - PAS a
+            #   attacher le controle sur le trace. Les confondre (comme le
+            #   Fortran authentique le fait pour le calcul, pas seulement
+            #   pour le trace) casse le calcul : verifie sur GHI09B04
+            #   (example_magic_19491.prmag, int_drats=4.1% publie) que
+            #   matcher xt/xtptrm par le slot COURANT au lieu de l'etape
+            #   CIBLE donne des "ecart" entre -99% et +256% (non
+            #   physique).
             k = _cartest(mesures[i].cod2, table)
             if k < 0:
                 continue
@@ -294,26 +319,36 @@ def _compute_arai_coe(
             if i > 0 and mesures[i - 1].cod1 == "P":
                 if _cartest(mesures[i - 1].cod2, table) == k:
                     ntest = 2
+            target_etape = mesures[i].etape
+            s_idx = next(
+                (jj for jj in range(1, n)
+                 if mesures[jj].cod1 == "S" and mesures[jj].etape == target_etape),
+                None,
+            )
+            if s_idx is None:
+                continue
             check = PtrmCheck(k=k, ntest=ntest, temp=_step_of(mesures[i]))
-            found_r = False
-            found_s = False
-            for ji in range(1, n):
-                if mesures[ji].cod1 == "R":
-                    ki = _cartest(mesures[ji].cod2, table)
-                    if ki != k:
-                        continue
-                    check.xt = vecdiff(ji, i)
-                    found_r = True
-                    break
-                if found_s:
-                    continue
-                if mesures[ji].cod1 != "S":
-                    continue
-                if mesures[ji].etape == mesures[i].etape:
-                    check.yt = math.sqrt(xs[ji] ** 2 + ys[ji] ** 2 + zs[ji] ** 2) / arno
-                    check.xtptrm = vecdiff(i - 1, i)
-                    found_s = True
-            if found_r or found_s:
+            check.yt = math.sqrt(xs[s_idx] ** 2 + ys[s_idx] ** 2 + zs[s_idx] ** 2) / arno
+            found = False
+            r_idx = next(
+                (jj for jj in range(1, n)
+                 if mesures[jj].cod1 == "R" and mesures[jj].etape == target_etape),
+                None,
+            )
+            if r_idx is not None:
+                check.xtptrm = vecdiff(r_idx, s_idx)
+                found = True
+            # xt : pTRM re-acquise par le controle lui-meme, isolee par le
+            # 'S' COURANT le plus proche (la baseline zero-field en
+            # vigueur au moment du controle, PAS celle de l'etape cible) -
+            # meme methodologie que pmag.sortarai (baseline "step-1"),
+            # mais recherchee explicitement plutot que supposee adjacente.
+            s_current_idx = next(
+                (jj for jj in range(i - 1, 0, -1) if mesures[jj].cod1 == "S"), None)
+            if s_current_idx is not None:
+                check.xt = vecdiff(s_current_idx, i)
+                found = True
+            if found:
                 checks.append(check)
             continue
 
@@ -392,7 +427,15 @@ def compute_arai(
     if len(mesures) < 2:
         return [], [], 0.0
 
-    factor = 1.0e6 / (ech.vol or 1.0)  # equivalent x(jj)=mes.x*1e6/vol (toujours 1e6, pas de test norme ici)
+    # equivalent x(jj)=mes.x*1e6/vol (toujours 1e6, pas de test norme ici) -
+    # SAUF si ech.vol est manquant (0/None), auquel cas pas de facteur du
+    # tout (moment total brut, Am2) plutot que d'appliquer quand meme 1e6 a
+    # un volume absent (bug Fortran confirme - demande explicite
+    # utilisateur, "the previous Fortran was systematically dividing by
+    # mass and volume and was not expecting no vol and no mass"). La
+    # PENTE Arai (le resultat de paleointensite) est invariante a ce choix
+    # (facteur uniforme sur tous les points) - seul l'affichage change.
+    factor = (1.0e6 / ech.vol) if ech.vol else 1.0
     xs, ys, zs = [], [], []
     for m in mesures:
         x, y, z = apply_orientation(m.x * factor, m.y * factor, m.z * factor, ech, orientation)
@@ -472,6 +515,18 @@ def compute_arai(
             # temperature reellement re-testee - transcrit tel quel, lignes
             # 33130-33190). ntest=2 si le point precedent est aussi 'P' avec
             # le meme k (deux checks au meme "endroit" du graphique).
+            #
+            # NOTE : le meme defaut structurel que _compute_arai_coe (k
+            # derive du cod2 COPIE, pas de l'etape cible) existe a
+            # l'identique dans ce bloc Fortran (plotpaleoint2.f:587-624) -
+            # mais ICI, contrairement a l'IZZI (GHI09B04, confirme faux
+            # contre l'int_drats=4.1% publie), appliquer la MEME correction
+            # (retrouver R/V par etape cible, isoler xt via le 'R' courant)
+            # REGRESSE sur la seule donnee reelle disponible pour ce bloc
+            # (06A, SanJuan_Pmag.prmag : ecart -11%/+6% avant, jusqu'a
+            # -54%/+99% apres) - sans transcript/valeur publiee pour
+            # arbitrer, la version fidele au Fortran (ci-dessous) est
+            # conservee ici plutot qu'un changement non verifie.
             k = _cartest(mesures[i].cod2, table)
             if k < 0:
                 continue
@@ -548,6 +603,58 @@ def compute_arai(
     return result_points, checks, arno
 
 
+def nrm0_vector(ech: SelectedSample, orientation: int = 1) -> Optional[Tuple[float, float, float]]:
+    """Vecteur NRM initiale (cod1='N', repli sur mesures[0] sinon - MEME
+    detection que compute_arai), dans le MEME repere/unites que AraiPoint.
+    nrm_vec (facteur 1e6/vol si ech.vol, rotation `orientation`). C'est
+    "xnr(1)" du Fortran (rf1rf2, plotpaleoint2.f:1568-1588) - le point de
+    depart de la chaine VDS que compute_arai lui-meme n'expose pas (seule
+    sa norme, `arno`, est retournee) - necessaire pour compute_rf1_rf2."""
+    mesures = ech.mesures
+    if not mesures:
+        return None
+    factor = (1.0e6 / ech.vol) if ech.vol else 1.0
+    ideb = next((i for i, m in enumerate(mesures) if m.cod1 == "N"), 0)
+    m = mesures[ideb]
+    return apply_orientation(m.x * factor, m.y * factor, m.z * factor, ech, orientation)
+
+
+def compute_rf1_rf2(
+    points: List[AraiPoint], n1: int, n2: int,
+    nrm0: Optional[Tuple[float, float, float]],
+) -> Tuple[Optional[float], Optional[float]]:
+    """Port exact de `rf1rf2` (plotpaleoint2.f:1568-1588) - demande
+    explicite utilisateur ("une de mes collegues trouve interessant de
+    garder f1 et f2. est-ce possible de les calculer comme dans les
+    sources en Fortran"). Construit la chaine VDS (vector difference sum)
+    xnr(1)=NRM initiale, xnr(2..n2+1)=points[0..n2-1].nrm_vec, cumulee EN
+    PARTANT DE LA FIN (xnr(n2+1)) VERS LE DEBUT (xnr(1)) - rint2(j) =
+    somme des |xnr(i)-xnr(i+1)| pour i=j..n2, plus |xnr(n2+1)| (le
+    dernier point compte pour sa propre norme, pas une difference). rf1 =
+    fraction de cette somme totale (rint2(1)) qui reste a partir du DEBUT
+    de l'intervalle utilise (xnr(n1+1)) ; rf2 = fraction qui reste a
+    partir de la FIN de l'intervalle (xnr(n2+1), donc juste |xnr(n2+1)|/
+    total) - un intervalle "complet" (utilisant presque toute la
+    decroissance de NRM disponible) a rf1 proche de 1 et rf2 proche de 0.
+    None, None si les entrees ne permettent pas le calcul (nrm0 absent,
+    intervalle invalide, ou somme totale nulle)."""
+    if nrm0 is None or n1 < 1 or n2 < 1 or n2 > len(points) or n1 > n2:
+        return None, None
+    xnr = [nrm0] + [p.nrm_vec for p in points[:n2]]
+    m = len(xnr) - 1  # == n2
+    rint2 = [0.0] * len(xnr)
+    rint2[m] = math.sqrt(sum(c * c for c in xnr[m]))
+    for j in range(m - 1, -1, -1):
+        dx = xnr[j][0] - xnr[j + 1][0]
+        dy = xnr[j][1] - xnr[j + 1][1]
+        dz = xnr[j][2] - xnr[j + 1][2]
+        rint2[j] = rint2[j + 1] + math.sqrt(dx * dx + dy * dy + dz * dz)
+    rmax2 = rint2[0]
+    if rmax2 == 0:
+        return None, None
+    return rint2[n1] / rmax2, rint2[n2] / rmax2
+
+
 def fit_arai_line(points: List[AraiPoint], n1: int, n2: int, hlab: float = 0.0) -> AraiFit:
     """Equivalent du calcul de pente/intercept + statistiques de qualite
     (lignes 1153-1248). `n1`,`n2` : position 1-based dans `points` (PAS le
@@ -606,8 +713,52 @@ class AraiDirection:
     free_dec: Optional[float] = None
     free_inc: Optional[float] = None
     free_mad: Optional[float] = None
+    # avant rotation orientation - meme role que anchored_specimen_frame,
+    # pour comparer avant/apres correction d'anisotropie (voir
+    # fit_arai_direction_corrected/angle_between_vectors) - demande
+    # explicite utilisateur ("afficher les directions (anchored not
+    # anchored) avant et apres correction d'anisotropie").
+    free_specimen_frame: Optional[Tuple[float, float, float]] = None
     nb: int = 0
     dang: Optional[float] = None
+
+
+def _fit_direction_from_vectors(
+    raw_pts: List[Tuple[float, float, float]], ech: SelectedSample, orientation: int,
+) -> AraiDirection:
+    """Coeur commun de fit_arai_direction/fit_arai_direction_corrected :
+    ACP ancree+libre (calcul.linear_fit, seuil MAD 35 deg) sur des
+    vecteurs specimen deja prets (bruts ou corriges pour l'anisotropie),
+    rotation selon `orientation`, DANG entre les deux."""
+    result = AraiDirection(nb=len(raw_pts))
+    if len(raw_pts) < 2:
+        return result
+
+    anchored = linear_fit(raw_pts, anchored=True, mad_threshold=35.0)
+    free = linear_fit(raw_pts, anchored=False, mad_threshold=35.0)
+
+    dir_anchored = dir_free = None
+    if anchored is not None:
+        result.anchored_specimen_frame = tuple(anchored["direction"])
+        dx, dy, dz = apply_orientation(*anchored["direction"], ech, orientation)
+        _, dec, inc = polere(dx, dy, dz)
+        result.anchored_dec, result.anchored_inc, result.anchored_mad = dec, inc, anchored["mad"]
+        dir_anchored = (dx, dy, dz)
+    if free is not None:
+        result.free_specimen_frame = tuple(free["direction"])
+        dx, dy, dz = apply_orientation(*free["direction"], ech, orientation)
+        _, dec, inc = polere(dx, dy, dz)
+        result.free_dec, result.free_inc, result.free_mad = dec, inc, free["mad"]
+        dir_free = (dx, dy, dz)
+
+    if dir_anchored is not None and dir_free is not None:
+        na = math.sqrt(sum(c * c for c in dir_anchored))
+        nf = math.sqrt(sum(c * c for c in dir_free))
+        if na > 0 and nf > 0:
+            cosang = sum(dir_anchored[i] * dir_free[i] for i in range(3)) / (na * nf)
+            result.dang = math.degrees(math.acos(max(-1.0, min(1.0, cosang))))
+
+    return result
 
 
 def fit_arai_direction(
@@ -624,35 +775,50 @@ def fit_arai_direction(
     de calculer dec/inc. `dang` = angle entre les deux directions (Lisa
     Tauxe DANG)."""
     sub = points[n1 - 1:n2]
-    result = AraiDirection(nb=len(sub))
-    if len(sub) < 2:
-        return result
+    return _fit_direction_from_vectors([p.nrm_vec for p in sub], ech, orientation)
 
-    raw_pts = [p.nrm_vec for p in sub]
-    anchored = linear_fit(raw_pts, anchored=True, mad_threshold=35.0)
-    free = linear_fit(raw_pts, anchored=False, mad_threshold=35.0)
 
-    dir_anchored = dir_free = None
-    if anchored is not None:
-        result.anchored_specimen_frame = tuple(anchored["direction"])
-        dx, dy, dz = apply_orientation(*anchored["direction"], ech, orientation)
-        _, dec, inc = polere(dx, dy, dz)
-        result.anchored_dec, result.anchored_inc, result.anchored_mad = dec, inc, anchored["mad"]
-        dir_anchored = (dx, dy, dz)
-    if free is not None:
-        dx, dy, dz = apply_orientation(*free["direction"], ech, orientation)
-        _, dec, inc = polere(dx, dy, dz)
-        result.free_dec, result.free_inc, result.free_mad = dec, inc, free["mad"]
-        dir_free = (dx, dy, dz)
+def fit_arai_direction_corrected(
+    points: List[AraiPoint], n1: int, n2: int,
+    ech: SelectedSample, tensor: AniTensor, orientation: int = 1,
+) -> AraiDirection:
+    """Comme fit_arai_direction, mais sur les vecteurs NRM CORRIGES pour
+    l'anisotropie (inverse du tenseur A0, MEME normalisation par trace que
+    calcul.apply_inverse_anisotropy, applique a chaque point AVANT
+    l'ajustement ACP) - ne mute PAS ech.mesures (contrairement a
+    "Inverse_ANI_correction..."/calcul.apply_inverse_anisotropy) : une
+    comparaison ponctuelle avant/apres, pas une modification permanente -
+    demande explicite utilisateur ("ce serait bien d'afficher les
+    directions (anchored not anchored) avant et apres correction
+    d'anisotropie ; ça donne une idée de la déviation des directions du
+    champ par l'anisotropie de la roche")."""
+    sub = points[n1 - 1:n2]
+    rnorm = (tensor.k11 + tensor.k22 + tensor.k33) / 3.0
+    if rnorm == 0:
+        corrected_pts = [p.nrm_vec for p in sub]
+    else:
+        a, b, c = tensor.k11 / rnorm, tensor.k12 / rnorm, tensor.k13 / rnorm
+        d, e, f = tensor.k22 / rnorm, tensor.k23 / rnorm, tensor.k33 / rnorm
+        corrected_pts = [inverse_symmetric_3x3(a, b, c, d, e, f, *p.nrm_vec) for p in sub]
+    return _fit_direction_from_vectors(corrected_pts, ech, orientation)
 
-    if dir_anchored is not None and dir_free is not None:
-        na = math.sqrt(sum(c * c for c in dir_anchored))
-        nf = math.sqrt(sum(c * c for c in dir_free))
-        if na > 0 and nf > 0:
-            cosang = sum(dir_anchored[i] * dir_free[i] for i in range(3)) / (na * nf)
-            result.dang = math.degrees(math.acos(max(-1.0, min(1.0, cosang))))
 
-    return result
+def angle_between_vectors(
+    v1: Optional[Tuple[float, float, float]], v2: Optional[Tuple[float, float, float]],
+) -> Optional[float]:
+    """Angle (deg) entre deux vecteurs 3D - utilise pour chiffrer la
+    deviation de direction (ancree ou libre) induite par la correction
+    d'anisotropie, en comparant AraiDirection.anchored_specimen_frame (ou
+    free_specimen_frame) avant/apres calcul.apply_inverse_anisotropy -
+    None si l'un des deux vecteurs est absent/nul."""
+    if v1 is None or v2 is None:
+        return None
+    n1 = math.sqrt(sum(c * c for c in v1))
+    n2 = math.sqrt(sum(c * c for c in v2))
+    if n1 == 0 or n2 == 0:
+        return None
+    cosang = sum(v1[i] * v2[i] for i in range(3)) / (n1 * n2)
+    return math.degrees(math.acos(max(-1.0, min(1.0, cosang))))
 
 
 @dataclass
@@ -1081,7 +1247,9 @@ def draw_arai(
     # texte NRM - lignes 921-929 (nchar = longueur REELLE du texte forme,
     # equivalent `nlen=len(trim(text))` - pas une valeur figee, sous peine
     # de tronquer le texte comme le faisait une premiere version buguee)
-    if ech.norme == "v":
+    if not ech.vol:
+        nrm_text = f"NRM ={arno:6.2f} Am2"
+    elif ech.norme == "v":
         nrm_text = f"NRM ={arno:6.2f} A/m"
     else:
         nrm_text = f"NRM ={arno * 0.001:6.4f} Am2/kg"
@@ -1278,3 +1446,101 @@ def build_paleoint_review_figure(
     # larger within the page").
     fig.subplots_adjust(left=0.02, right=0.98, top=0.95, bottom=0.02, hspace=0.06, wspace=0.03)
     return fig
+
+
+# ---------------------------------------------------------------------------
+# .pmagint : archivage des resultats de paleointensite (compagnon de
+# .prmag/.pmagres/.pmagani, voir calcul.pmagint_path_for) - equivalent de
+# l'ecriture Fortran dans tempint.txt (visi_Paleoint.f:40,1456-1490,
+# format 4456) par `openfilepint`, JAMAIS porte en Python auparavant
+# (seul le reaffichage l'a ete - voir app.ouvrir_openfilepint_dialog) -
+# demande explicite utilisateur ("je souhaite avoir un fichier
+# supplementaire avec la ligne de resultats de paleointensite... il
+# contiendrait les donnees comme dans tempint.txt").
+# ---------------------------------------------------------------------------
+
+_PMAGINT_HEADER = [
+    "specimen", "t1", "t2", "f1", "f2", "N", "f", "g", "q", "mad", "dang",
+    "pct_crm", "Hlab", "b", "sb", "sb_over_b", "ccr", "H", "fcor", "Hcorani",
+    "fcorCool", "HcorCool", "gamma", "k", "k_sse",
+    "fvds", "frac", "gap_max", "n_ptrm", "tensor",
+]
+
+
+def _fmt_pmagint(v: Optional[float], fmt: str = "g") -> str:
+    return "n.d" if v is None else format(v, fmt)
+
+
+def _ensure_pmagint_header(path: str) -> None:
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# pmagint v1 - companion of .prmag/.pmagres/.pmagani, join key = specimen\n")
+            f.write(
+                "# mad/dang/fvds/frac/gap_max/n_ptrm: from the PmagPy/MagIC parallel "
+                "computation (pmag.PintPars), not the native Starmac fit - n.d if PmagPy "
+                "could not process this specimen/interval\n"
+            )
+            f.write(
+                "# tensor: A0 raw k11:k22:k33:k12:k23:k13 used for the anisotropy "
+                "correction (n.d if none applied)\n"
+            )
+            f.write("\t".join(_PMAGINT_HEADER) + "\n")
+
+
+def write_pmagint_line(
+    path: str, specimen_id: str, t1: float, t2: float, n: int,
+    f: float, g: float, q: float, hlab: float, b: float, sb: float, ccr: float, h: float,
+    mad: Optional[float] = None, dang: Optional[float] = None, pct_crm: Optional[float] = None,
+    fcor: Optional[float] = None, hcorani: Optional[float] = None,
+    fcor_cool: Optional[float] = None, hcor_cool: Optional[float] = None,
+    gamma: Optional[float] = None, k: Optional[float] = None, k_sse: Optional[float] = None,
+    fvds: Optional[float] = None, frac: Optional[float] = None,
+    gap_max: Optional[float] = None, n_ptrm: Optional[int] = None,
+    tensor: Optional[AniTensor] = None,
+    f1: Optional[float] = None, f2: Optional[float] = None,
+) -> None:
+    """Ajoute une ligne au fichier .pmagint (voir calcul.pmagint_path_for
+    pour l'emplacement) - une ligne par revue de resultat de
+    paleointensite (interactive ou en lot via "View batch of Paleoint
+    Results..."), en mode ajout (comme tempint.txt, `access='append'`).
+
+    `mad`/`dang`/`fvds`/`frac`/`gap_max`/`n_ptrm` viennent du traitement
+    PmagPy/MagIC PARALLELE (pmag.PintPars, voir paleointensity_magic.
+    MagicPintResult), PAS du calcul natif Starmac - demande explicite
+    utilisateur ("replace the mad and dang from the Pmagpy calculation of
+    the values MAD (free): DANG: and add f_vds: FRAC: and gap_max... also
+    add the number of pTRM checks"). `f1`/`f2` : port exact de `rf1rf2`
+    (calcul.paleointensity.compute_rf1_rf2, voir sa docstring) - retires
+    une premiere fois faute d'etre portes ("rf1/rf2 not yet ported"),
+    remis apres portage explicite ("une de mes collegues trouve
+    interessant de garder f1 et f2... calcules comme dans les sources en
+    Fortran").
+
+    `tensor` : le tenseur A0 BRUT (voir calcul.AniTensor, PAS normalise -
+    correspond aux valeurs deja vues dans tempint.txt, de l'ordre de 1e-5
+    a 1e-8) utilise pour calculer fcor/Hcorani - le Fortran n'ecrit ce
+    champ QUE si une correction a ete appliquee (`fcor!=1` -> trim(tensor)
+    ajoute a la fin de la ligne, absent sinon) ; ici la colonne existe
+    TOUJOURS (schema fixe en largeur, comme .pmagani), "n.d" en son
+    absence."""
+    _ensure_pmagint_header(path)
+    sb_over_b = (sb / b) if b else None
+    tensor_field = (
+        f"{tensor.k11:.5E}:{tensor.k22:.5E}:{tensor.k33:.5E}:"
+        f"{tensor.k12:.5E}:{tensor.k23:.5E}:{tensor.k13:.5E}"
+    ) if tensor is not None else "n.d"
+    fields = [
+        specimen_id, f"{t1:g}", f"{t2:g}", _fmt_pmagint(f1, ".3f"), _fmt_pmagint(f2, ".3f"),
+        str(n), f"{f:.3f}", f"{g:.3f}", f"{q:.1f}",
+        _fmt_pmagint(mad, ".1f"), _fmt_pmagint(dang, ".1f"), _fmt_pmagint(pct_crm, ".1f"),
+        f"{hlab:.1f}", f"{b:.4f}", f"{sb:.4f}", _fmt_pmagint(sb_over_b, ".4f"),
+        f"{ccr:.5f}", f"{h:.2f}",
+        _fmt_pmagint(fcor, ".3f"), _fmt_pmagint(hcorani, ".2f"),
+        _fmt_pmagint(fcor_cool, ".3f"), _fmt_pmagint(hcor_cool, ".2f"),
+        _fmt_pmagint(gamma, ".1f"), _fmt_pmagint(k, ".4f"), _fmt_pmagint(k_sse, ".5f"),
+        _fmt_pmagint(fvds, ".3f"), _fmt_pmagint(frac, ".3f"), _fmt_pmagint(gap_max, ".3f"),
+        "n.d" if n_ptrm is None else str(n_ptrm),
+        tensor_field,
+    ]
+    with open(path, "a", encoding="utf-8") as f_out:
+        f_out.write("\t".join(fields) + "\n")

@@ -513,19 +513,25 @@ def format_custom_output(
 
 def _convert_step_range(row):
     """Convertit meas_step_min/max vers la convention d'étape Starmac selon
-    meas_step_unit : 'T' (Tesla) -> mT*10 (etape F, ex. 0.018T -> 180),
-    'K' (Kelvin) -> degC (etape D, ex. 573K -> 300). Le K->degC est fait par
+    meas_step_unit : 'T'/'Tesla' -> mT*10 (etape F, ex. 0.018T -> 180),
+    'K'/'Kelvin' -> degC (etape D, ex. 573K -> 300). Le K->degC est fait par
     SOUSTRACTION de 273 (comme `ttemp_c = ttemp_raw - 273.0` déjà utilisé
     plus haut dans ce fichier pour la même conversion sur les mesures elles-
-    mêmes) - pas par addition. Retourne (None, None) si non convertible."""
+    mêmes) - pas par addition. `meas_step_unit` est un champ texte LIBRE du
+    data model 3 (pas de vocabulaire controle) : comparaison par PREFIXE
+    (startswith "K"/"T") plutot qu'egalite stricte - bug reel corrige, une
+    vraie contribution MagIC (magic_contribution_19491.txt) ecrit "Kelvin"
+    en toutes lettres, jamais reconnu par l'egalite stricte a "K"
+    (magic_results_to_redo_lines retournait silencieusement une liste vide
+    sur ce fichier). Retourne (None, None) si non convertible."""
     unit = clean_str(row.get("meas_step_unit", "")).upper()
     smin = parse_float_val(row.get("meas_step_min", ""), None)
     smax = parse_float_val(row.get("meas_step_max", ""), None)
     if smin is None or smax is None:
         return None, None
-    if unit == "T":
+    if unit.startswith("T"):
         return int(round(smin * 10000.0)), int(round(smax * 10000.0))
-    if unit == "K":
+    if unit.startswith("K"):
         return int(round(smin - 273.0)), int(round(smax - 273.0))
     return int(round(smin)), int(round(smax))
 
@@ -590,6 +596,98 @@ def magic_results_to_redo_lines(specimens_source, combined=False) -> list:
             continue
         seen.add(key)
         lines.append(f"{specimen:<12} {bestfit}  {ancr}    {smin} {smax} {comp}")
+    return lines
+
+
+# Variantes LP-PI-* (vocabulaire MagIC, www2.earthref.org/MagIC/
+# method-codes.json) qui ne sont PAS un protocole Thellier/IZZI
+# thermique classique - AF, micro-ondes, multi-specimen, ou un proxy
+# alternatif (ARM/IRM/susceptibilite) au lieu d'une vraie sequence
+# TRM/four - jamais rejouables par le natif Starmac (afficher_arai
+# attend des paliers thermiques R/V/P) meme si la ligne porte aussi le
+# tag generique "LP-PI" - voir magic_pint_results_to_redo_lines.
+_PI_NON_TRM_CODES = {
+    "LP-PI-AFAF", "LP-PI-ARM", "LP-PI-IRM", "LP-PI-X", "LP-PI-PARM",
+    "LP-PI-REL", "LP-PI-REL-PT", "LP-PI-SXTAL", "LP-PI-CHEM",
+    "LP-PI-TRIAXE", "LP-PI-MULT", "LP-PI-MULT-DB", "LP-PI-MULT-FL",
+    "LP-PI-M", "LP-PI-M-II", "LP-PI-M-IZ", "LP-PI-M-IZZI",
+    "LP-PI-M-PERP", "LP-PI-M-QP", "LP-PI-M-ZI",
+}
+
+
+def magic_pint_results_to_redo_lines(specimens_source, combined=False) -> list:
+    """Meme principe que `magic_results_to_redo_lines` (specimens.txt deja
+    interprete -> lignes "redo"), pour les determinations de PALEOINTENSITE
+    plutot que les ajustements directionnels ligne/plan - demande explicite
+    utilisateur ("during import of Magic paleoint data, can you write a
+    redo_pint_contribution_num.txt file with the specimen number and step1
+    and step2 found in specimens.txt file. This redo file can be used in
+    view Paleointensity data").
+
+    Format de sortie : "specimen tmin tmax" (une ligne par specimen), le
+    format attendu par `ouvrir_openfilepint_dialog`/`openfilepint`
+    (visi_Paleoint.f) - PAS le format ligne/plan de
+    `magic_results_to_redo_lines` (colonnes bestfit/ancr/comp n'ont pas de
+    sens pour une interpretation de paleointensite).
+
+    Selection des lignes : method_codes contient "LP-PI-TRM" (protocole
+    Thellier/IZZI thermique explicite) OU le tag generique "LP-PI" seul
+    (protocole paleointensite non davantage precise) ET result_quality==
+    'g'. BUG REEL corrige (signale par l'utilisateur : "during import of
+    Magic data with paleointensity, it is possible to create a redo
+    file? can find it" - le fichier n'etait pas cree du tout) : la
+    premiere version n'acceptait QUE "LP-PI-TRM" litteralement, alors
+    qu'une contribution reelle (Miriam_Magic/magic_contribution_20536.txt,
+    276 lignes result_quality='g' exploitables) tague ses determinations
+    Thellier classiques (pTRM check + fit anchore - method_codes
+    "LP-NO:LP-PI:LP-PI-ALT-PTRM:DE-BFL-A") avec le tag generique "LP-PI"
+    SANS jamais ecrire "LP-PI-TRM" explicitement - toutes silencieusement
+    ecartees (0 ligne, aucun fichier ecrit, aucun avertissement). La
+    presence de "LP-PI-ALT-PTRM" (pTRM check, un concept qui n'existe que
+    pour un protocole TRM/thermique - voir vocabulaire MagIC) confirme
+    qu'un "LP-PI" nu designe ici bien un Thellier/IZZI thermique classique,
+    rejouable par le natif Starmac (paleointensity.py/afficher_arai) au
+    meme titre qu'un "LP-PI-TRM" explicite. Exclut toujours les variantes
+    clairement NON rejouables de cette facon (`_PI_NON_TRM_CODES`
+    ci-dessous - AF/micro-ondes/multi-specimen/proxy alternatif) meme si
+    elles portent aussi le tag "LP-PI", et exclut deliberement les lignes
+    "IE-BICEP" (methode Bootstrapped Common Enclosing Prism, calcul
+    multi-specimens sans borne de temperature rejouable individuellement
+    de la meme facon, verifie sur une vraie contribution -
+    magic_contribution_19491.txt - ou ces lignes existent en DOUBLON du
+    meme int_abs/meas_step_min/max qu'une ligne LP-PI-TRM sœur, mais ne
+    representent pas un second ajustement independant a rejouer).
+    Deduplique par specimen (une determination retenue par specimen).
+    Retourne None si la table specimens est introuvable/vide."""
+    if combined:
+        tables = split_combined_magic_file(specimens_source)
+        df = tables.get("specimens")
+    else:
+        df = read_magic_file(specimens_source)
+
+    if df is None or df.empty:
+        print("❌ Specimens table not found or empty.")
+        return None
+
+    seen = set()
+    lines = []
+    for _, row_series in df.iterrows():
+        row = row_series.to_dict()
+        if clean_str(row.get("result_quality", "")).lower() != "g":
+            continue
+        codes = {c.strip() for c in clean_str(row.get("method_codes", "")).split(":") if c.strip()}
+        is_trm_variant = any(c == "LP-PI-TRM" or c.startswith("LP-PI-TRM-") for c in codes)
+        is_generic_pi = "LP-PI" in codes and not (codes & _PI_NON_TRM_CODES)
+        if not (is_trm_variant or is_generic_pi):
+            continue
+        smin, smax = _convert_step_range(row)
+        if smin is None:
+            continue
+        specimen = clean_str(row.get("specimen", ""))[:12]
+        if not specimen or specimen in seen:
+            continue
+        seen.add(specimen)
+        lines.append(f"{specimen} {smin} {smax}")
     return lines
 
 
@@ -673,7 +771,8 @@ def magic_site_means(sites_source, combined=True) -> Optional[List[dict]]:
     voir _TILT_CORRECTION_TO_ORIENTATION), dec, inc, alpha95, k, n,
     specimens (liste de noms, depuis la colonne "specimens" - "samples" en
     repli si absente), lat, lon (coordonnees du SITE, pas du specimen),
-    vgp_lat, vgp_lon. Une ligne dont dir_tilt_correction vaut "-1" ou est
+    vgp_lat, vgp_lon, component (dir_comp_name, "A" si absent - voir
+    calcul.FitResult.component). Une ligne dont dir_tilt_correction vaut "-1" ou est
     absent/non reconnu est ECARTEE (jamais rangee par defaut en
     1/echantillon - voir le commentaire pres de
     _TILT_CORRECTION_TO_ORIENTATION), avec un compte-rendu imprime.
@@ -727,6 +826,21 @@ def magic_site_means(sites_source, combined=True) -> Optional[List[dict]]:
             "lon": parse_float_val(row.get("lon", ""), 0.0),
             "vgp_lat": parse_float_val(row.get("vgp_lat", ""), 0.0),
             "vgp_lon": parse_float_val(row.get("vgp_lon", ""), 0.0),
+            # Ovale de confiance du VGP - present directement dans CERTAINES
+            # contributions reelles (verifie : magic_contribution_20340.txt)
+            # ; 0.0 si absent, calcule alors depuis alpha95/inc au moment de
+            # l'archivage (voir convert_magic_to_r._convert_magic_results,
+            # calcul.dp_dm_from_a95) - demande explicite utilisateur.
+            "vgp_dp": parse_float_val(row.get("vgp_dp", ""), 0.0),
+            "vgp_dm": parse_float_val(row.get("vgp_dm", ""), 0.0),
+            # Etiquette de composante de magnetisation (voir
+            # calcul.FitResult.component) - "Site direction component
+            # name" dans le modele MagIC (verifie live sur
+            # earthref.org/MagIC/data-models/3.0.json), permet a une
+            # contribution reelle de distinguer plusieurs moyennes du meme
+            # site (ex. "A"/"B") des l'import. "A" si absent (ancien
+            # champ, valeur par defaut de FitResult.component).
+            "component": clean_str(row.get("dir_comp_name", "")) or "A",
         })
     if n_skipped_sample_coords:
         print(f"⚠️  {n_skipped_sample_coords} site mean(s) skipped: dir_tilt_correction "

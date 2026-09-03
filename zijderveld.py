@@ -27,7 +27,7 @@ from typing import List, Optional
 from matplotlib.figure import Figure
 
 from selection import SelectedSample, apply_orientation, split_experiments, experiment_kind
-from stereo import draw_stereo_net, draw_stereo_measurements
+from stereo import draw_stereo_net, draw_stereo_measurements, draw_stereo_results
 from plotlib import PlotContext, char_width_cm
 
 _DEMAG_TYPES = {"F": "AF", "D": "TH", "S": "TH", "C": "CH"}
@@ -35,6 +35,23 @@ _ORIENT_CODES = {1: "SC", 2: "IS", 3: "BC"}
 
 
 def _scale_factor(ech: SelectedSample) -> float:
+    """1e3 (masse, Am2/kg) ou 1e6 (volume, A/m) - SAUF si `ech.vol` est
+    manquant (0/None), auquel cas 1.0 (aucun facteur applique) - demande
+    explicite utilisateur ("when the volume or the mass of the sample is
+    not given, best to show the data in total moment as done in the
+    list... the previous Fortran was systematically dividing by mass and
+    volume and was not expecting no vol and no mass"). Le Fortran
+    d'origine divisait TOUJOURS par `ech.vol` sans jamais verifier qu'il
+    etait renseigne - BUG CONFIRME (pas seulement une division par zero
+    evitee, une VALEUR FAUSSE affichee : `ech.vol or 1.0` seul, sans ce
+    garde-fou sur `factor`, appliquerait quand meme le facteur 1e3/1e6 a
+    un moment BRUT, affichant un nombre sans rapport avec l'unite
+    revendiquee "A/m"/"Am2/kg"). Sans volume/masse, le moment total brut
+    (Am2) est affiche tel quel, comme le fait deja list_measurements
+    (colonne "Mtot Am2", toujours calculee independamment du volume) -
+    voir aussi le libelle d'unite plus bas (`unit`)."""
+    if not ech.vol:
+        return 1.0
     return 1.0e3 if ech.norme == "m" else 1.0e6
 
 
@@ -331,7 +348,9 @@ def draw_zijderveld(
         )
 
     # texte recapitulatif : echelle, id, type de desaimantation, orientation
-    unit = "Am2/kg" if ech.norme == "m" else "A/m"
+    # "Am2" (moment total brut, PAS normalise) si vol/masse absent - voir
+    # _scale_factor.
+    unit = "Am2" if not ech.vol else ("Am2/kg" if ech.norme == "m" else "A/m")
     scale_val = 10.0 ** ik
     scale_text = f"scale: {scale_val:g}{unit}"
     demag_text = "+".join(demag_types_seen) if demag_types_seen else _DEMAG_TYPES.get(demag_code, "")
@@ -393,5 +412,58 @@ def build_zijderveld_figure(
     # de l'utilisateur - la marge horizontale reste au defaut.
     ax.margins(y=0.01)
     ax.autoscale_view()
+    fig.tight_layout()
+    return fig
+
+
+def build_zijderveld_stereo_results_figure(
+    ech: SelectedSample,
+    result,
+    orientation: int = 1,
+    fig: Optional[Figure] = None,
+) -> Figure:
+    """Zijderveld + Stereo Results (avec grand cercle) cote a cote - demande
+    explicite utilisateur ("in data+interpretation, when there is a plane,
+    keep the plot zijderveld+stereo and plot the great circle on the
+    stereo") : le Fortran d'origine (visres, plotorthog.f:107-121) n'affiche
+    QUE `sterres` pour un resultat de plan (cat1='P') - PAS `zijder` - un
+    choix delibere du programme d'origine, pas un bug de portage (verifie
+    contre le source). Extension demandee au-dela du Fortran : voir les
+    deux ensemble aide a confirmer visuellement l'ajustement de plan contre
+    le trajet de desaimantation brut.
+
+    Panneau gauche : Zijderveld de `ech` (`fits=[result]` pour l'etiquette
+    "fit between X and Y" - le petit encart stereo integre est DESACTIVE
+    ici, `show_stereo=False`, redondant avec le panneau droit qui montre le
+    MEME reseau en plus grand et avec le grand cercle du plan, absent de
+    l'encart). Panneau droit : Stereo Results (draw_stereo_results, meme
+    fonction que `build_stereo_results_figure`) sur `[result]` uniquement -
+    trace le grand cercle si `result.cat1=='P'`, un point sinon (L/f)."""
+    if fig is None:
+        fig = Figure(figsize=(11.0, 6.0), dpi=100)
+    else:
+        fig.clear()
+
+    ax_zij = fig.add_subplot(121)
+    ctx_zij = PlotContext(ax_zij)
+    ctx_zij.clear()
+    ctx_zij.plot(0.0, 0.0, -3)
+    draw_zijderveld(ctx_zij, ech, orientation, [result], True, False)
+    ax_zij.relim()
+    ax_zij.margins(y=0.01)
+    ax_zij.autoscale_view()
+
+    ax_ster = fig.add_subplot(122)
+    ctx_ster = PlotContext(ax_ster)
+    ctx_ster.clear()
+    ctx_ster.plot(0.0, 0.0, -3)
+    dimster = 12.0 * 1.5
+    point_size = (0.18 * dimster) / 10.0
+    r = draw_stereo_net(ctx_ster, orientation, dimster=dimster)
+    draw_stereo_results(ctx_ster, [result], r, orientation, point_size=point_size, nbech=1)
+    ax_ster.relim()
+    ax_ster.autoscale_view()
+    ax_ster.set_title("Stereo Results")
+
     fig.tight_layout()
     return fig

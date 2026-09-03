@@ -49,6 +49,15 @@ class Measurement:
     # the paleointensity routine that the value of the step is often
     # really needed").
     step_value: Optional[float] = None
+    # 'g'/'b' (good/bad) - colonne "quality" du .prmag, jusque-la jamais
+    # lue (seule "error" -> `q` l'etait) - demande explicite utilisateur
+    # ("je voudrais utiliser le critere de qualite b/g dans les donnees
+    # pour ne pas prendre en compte cette etape... un des problemes en
+    # paleointensite est eventuellement qu'une serie d'echantillons ne
+    # soient pas mis correctement dans le four... on peut mettre la
+    # qualification b"). "g" par defaut (mesure normale) si la colonne
+    # est absente/vide - voir datatools.remove_bad_quality_steps.
+    quality: str = "g"
 
 
 @dataclass
@@ -90,6 +99,18 @@ class Pmag:
     magic_li: str = ""
     magic_loc: str = ""
     magic_obs: str = ""
+    # Position stratigraphique du specimen dans une section/carotte -
+    # champ MagIC reel (`samples.height`, "Stratigraphic Height", metres,
+    # positif vers le haut - verifie dans pmagpy/data_model/data_model.json)
+    # plutot qu'un nom invente : demande explicite utilisateur ("add an
+    # additional variable: stratigraphic_position (or the Magic
+    # equivalent)... this field will replace the need to load a file for
+    # magnetostratigraphic studies" - voir List and depth.../
+    # ouvrir_lismesdepth_dialog, qui exigeait jusqu'ici un fichier externe
+    # specimen/depth separe). None si non renseigne (specimen sans
+    # position connue, ou format d'origine - .ren/Utrecht - qui n'a pas ce
+    # concept).
+    stratigraphic_height: Optional[float] = None
     mesures: List[Measurement] = field(default_factory=list)
 
     @property
@@ -413,9 +434,10 @@ def read_prmag_file(filepath: str, encoding: str = "utf-8") -> List[Pmag]:
     open file still look for .ren").
 
     Bloc par specimen : 4 lignes d'entete (specimen/sample/site/volume/
-    mass/lat/lon/elevation/comment ; azimuth/dip/date/magnetic_azimuth/
-    solar_azimuth/orient_tool ; bed_dip_strike/bed_dip ; formation/age/
-    geologic_classes/geologic_types/lithologies/location/obs/method_codes)
+    mass/lat/lon/elevation/stratigraphic_height/comment ; azimuth/dip/
+    date/magnetic_azimuth/solar_azimuth/orient_tool ; bed_dip_strike/
+    bed_dip ; formation/age/geologic_classes/geologic_types/lithologies/
+    location/obs/method_codes)
     puis une ligne d'entete de mesures (step/cod1/cod2/x/y/z/...) suivie
     des lignes de mesure - voir docstring de convert_ren_to_r.py pour le
     detail exact du format et des unites."""
@@ -449,6 +471,7 @@ def read_prmag_file(filepath: str, encoding: str = "utf-8") -> List[Pmag]:
         p.lat = _prmag_nd(line_a.get("lat"))
         p.rlong = _prmag_nd(line_a.get("lon"))
         p.altitude = _prmag_nd(line_a.get("elevation"))
+        p.stratigraphic_height = _prmag_nd_opt(line_a.get("stratigraphic_height"))
         vol_raw, mass_raw = line_a.get("volume", "n.d"), line_a.get("mass", "n.d")
         if _prmag_text(vol_raw):
             p.norme, p.vol = "v", _prmag_nd(vol_raw)
@@ -496,6 +519,7 @@ def read_prmag_file(filepath: str, encoding: str = "utf-8") -> List[Pmag]:
                 s=_prmag_nd(col("s")),
                 treat_dc_field=_prmag_nd_opt(col("treat_dc_lowfield")),
                 step_value=step_val,
+                quality=_prmag_text(col("quality")) or "g",
             )
             p.mesures.append(meas)
 

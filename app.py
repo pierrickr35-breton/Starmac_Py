@@ -10,7 +10,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from testlect import read_ren_file, read_prmag_file
 from convert_legacy_ren import convert_legacy_auto
-from complete_sample_info import complete_site_info, complete_specimen_info
+from complete_sample_info import complete_site_info, complete_specimen_info, complete_sample_height
 from import_new_data import parse_jr6_file, parse_legacy_new_measurements, archive_new_measurements
 from convert_ren_to_r import convert_file as convert_ren_to_r_file
 from convert_magic_to_r import convert_magic_file
@@ -39,9 +39,14 @@ from calcul import (
     fit_from_redo_file,
     fisher_from_measurements,
     fisher_from_results,
+    build_site_mean_result,
+    site_lat_lon_from_donnees,
+    _LINE_LIKE_CAT1,
     list_results,
     init_results,
     results_path_for,
+    ani_path_for,
+    pmagint_path_for,
     archivres,
     load_results,
     recompute_fit_geometry,
@@ -64,12 +69,13 @@ from calcul import (
     read_ani_tensor,
     apply_inverse_anisotropy,
     compute_anisotropy_tensor,
-    write_ani_tensor,
+    detect_six_positions,
+    write_ani_tensors,
     compute_anicor_factor,
     _ANI_CODE2,
     _correct_dec_inc,
 )
-from zijderveld import build_zijderveld_figure, draw_zijderveld
+from zijderveld import build_zijderveld_figure, draw_zijderveld, build_zijderveld_stereo_results_figure
 from stereo import build_stereo_figure, build_stereo_results_figure
 from xygraph import build_xygraph_figure, has_mixed_demag
 from susceptibility import build_susceptibility_figure
@@ -78,6 +84,10 @@ from paleointensity import (
     compute_arai,
     fit_arai_line,
     fit_arai_direction,
+    fit_arai_direction_corrected,
+    angle_between_vectors,
+    nrm0_vector,
+    compute_rf1_rf2,
     parse_com_field,
     detect_method_and_hlab,
     compute_crm,
@@ -85,17 +95,33 @@ from paleointensity import (
     build_arai_figure,
     build_paleoint_review_figure,
     draw_arai,
+    write_pmagint_line,
 )
 from paleointensity_magic import compute_magic_paleointensity, format_magic_paleointensity
 from datatools import (
     convert_thellier_to_nrm,
     remove_step,
+    remove_bad_quality_steps,
     eliminate_grm,
     convert_z_minus,
     export_thellier_tdt,
+    detect_grm,
 )
-from magic_export import export_to_magic
+from magic_export import export_to_magic, classify_anisotropy_experiment
+from anisotropy_magic import compute_aarm_pmagpy, format_aarm_pmagpy
+from export_stereo import export_results_to_stereo, export_poles_to_stereo
 from detailed_export import export_detailed_txt, export_latex
+from field_notes import (
+    parse_orientation_file,
+    parse_complement_file,
+    apply_complement,
+    check_utdif_for_sites,
+    build_pmag_records,
+    write_prmag_from_field_notes,
+    write_ged_file,
+    write_diagnostics_report,
+    parse_ged_file,
+)
 
 SVG_DEBUG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "svg_debug")
 
@@ -115,9 +141,10 @@ SVG_DEBUG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "svg_de
 # Note de syntaxe Tk (piege verifie empiriquement) : des que Shift est un
 # modificateur explicite, Tk exige la lettre du keysym en MAJUSCULE pour que
 # le binding se declenche - non applicable ici puisqu'on n'utilise plus Shift
-# du tout dans les combinaisons a 3 modificateurs.
+# du tout dans les combinaisons a 3 modificateurs (sauf sur Windows, voir
+# _SHORTCUTS_WIN plus bas).
 # valeur : (accelerateur affiche dans le menu, sequence de bind Tk)
-SHORTCUTS = {
+_SHORTCUTS_MAC = {
     "importpc":   ("Cmd+O",      "<Command-o>"),
     "starend":    ("Cmd+Ctrl+X", "<Command-Control-x>"),
     "selmes":     ("Cmd+E",      "<Command-e>"),
@@ -137,14 +164,79 @@ SHORTCUTS = {
     "initres":    ("Cmd+Ctrl+I", "<Command-Control-i>"),
     "plotzijder": ("Cmd+Ctrl+Z", "<Command-Control-z>"),
     "xygraph":    ("Cmd+Ctrl+Y", "<Command-Control-y>"),
+    "stereodata": ("Cmd+Ctrl+S", "<Command-Control-s>"),
+    # Cmd+Ctrl+Option+S essaye d'abord (demande explicite utilisateur) -
+    # BUG CONFIRME par l'utilisateur ("the shortcuts do not work for
+    # stereo results") : le gotcha Option+lettre documente en tete de ce
+    # dict (caractere accentue au lieu du keysym attendu) s'applique donc
+    # AUSSI avec Control comme modificateur additionnel, pas seulement
+    # avec Shift comme initialement verifie. Remplace par Cmd+Ctrl+P (pas
+    # d'Option) - meme lettre que _SHORTCUTS_WIN ("stereores": Ctrl+Shift+P),
+    # pour rester coherent entre les deux plateformes.
+    "stereores":  ("Cmd+Ctrl+P", "<Command-Control-p>"),
+    "ajusfisher": ("Cmd+Ctrl+G", "<Command-Control-g>"),
+    "suscep":     ("Cmd+Ctrl+K", "<Command-Control-k>"),
+    "meanint":    ("Cmd+Ctrl+M", "<Command-Control-m>"),
+    "anisotropy": ("Cmd+Ctrl+N", "<Command-Control-n>"),
 }
+
+# Version PC/Windows (et Linux) - demande explicite utilisateur ("for a PC
+# version can you provide shortcuts... those previously defined often
+# failed"). Cause racine : "Command"/"Meta" ne correspondent a AUCUNE touche
+# physique fiable sous Tk sur Windows (contrairement a "Cmd" sur Aqua) - le
+# bind ne leve pas d'erreur, il ne se declenche simplement JAMAIS, quel que
+# soit ce qu'on appelle la touche "Meta". Reprendre le meme schema en
+# substituant juste Command->Control (Ctrl+lettre seul) NE MARCHE PAS non
+# plus : ca percute (a) les bindings Emacs internes de Tk sur les widgets
+# Entry/Text (Ctrl+A/E/D/B/F/N/P/K/Y deja lies - meme raison que le choix de
+# Command sur Mac, voir _setup_shortcuts) et (b) les raccourcis universels
+# Windows/applicatifs (Ctrl+S=Enregistrer, Ctrl+F=Rechercher, Ctrl+Z=Annuler,
+# Ctrl+Y=Retablir, Ctrl+A=Tout selectionner...) - exactement les exemples
+# signales cassés par l'utilisateur (Zijderveld/GraphXY/Stereo data/best dir
+# Fisher utilisaient F/S/Y/Z/A en 2e lettre). Ctrl+Alt+lettre est EVITE : sur
+# les claviers europeens Windows (AZERTY/QWERTZ...), Ctrl+Alt EQUIVAUT a
+# AltGr, le meme mecanisme de composition de caracteres accentues/speciaux
+# que le gotcha Option documente ci-dessus pour Mac. Ctrl+Shift+<LETTRE> est
+# donc retenu partout : aucune collision connue (Windows/apps/Tk), et Shift
+# ne compose jamais de caractere special. Un seul palier de raccourcis ici
+# (pas de Ctrl+lettre "simple" + Ctrl+Shift+lettre "avance" comme sur Mac) -
+# chaque commande a sa propre lettre, jamais reutilisee.
+_SHORTCUTS_WIN = {
+    "importpc":   ("Ctrl+Shift+O", "<Control-Shift-O>"),
+    "starend":    ("Ctrl+Shift+Q", "<Control-Shift-Q>"),
+    "selmes":     ("Ctrl+Shift+E", "<Control-Shift-E>"),
+    "selentete":  ("Ctrl+Shift+H", "<Control-Shift-H>"),
+    "effmes":     ("Ctrl+Shift+D", "<Control-Shift-D>"),
+    "initmes":    ("Ctrl+Shift+I", "<Control-Shift-I>"),
+    "lismes":     ("Ctrl+Shift+L", "<Control-Shift-L>"),
+    "infoech":    ("Ctrl+Shift+J", "<Control-Shift-J>"),
+    "selce":      ("Ctrl+Shift+A", "<Control-Shift-A>"),
+    "selis":      ("Ctrl+Shift+B", "<Control-Shift-B>"),
+    "selcp":      ("Ctrl+Shift+T", "<Control-Shift-T>"),
+    "ajuslig":    ("Ctrl+Shift+G", "<Control-Shift-G>"),
+    "fishmes":    ("Ctrl+Shift+F", "<Control-Shift-F>"),
+    "fishres":    ("Ctrl+Shift+Y", "<Control-Shift-Y>"),
+    "lisres":     ("Ctrl+Shift+W", "<Control-Shift-W>"),
+    "selres":     ("Ctrl+Shift+R", "<Control-Shift-R>"),
+    "initres":    ("Ctrl+Shift+N", "<Control-Shift-N>"),
+    "plotzijder": ("Ctrl+Shift+Z", "<Control-Shift-Z>"),
+    "xygraph":    ("Ctrl+Shift+X", "<Control-Shift-X>"),
+    "stereodata": ("Ctrl+Shift+S", "<Control-Shift-S>"),
+    "stereores":  ("Ctrl+Shift+P", "<Control-Shift-P>"),
+    "ajusfisher": ("Ctrl+Shift+C", "<Control-Shift-C>"),
+    "suscep":     ("Ctrl+Shift+K", "<Control-Shift-K>"),
+    "meanint":    ("Ctrl+Shift+M", "<Control-Shift-M>"),
+    "anisotropy": ("Ctrl+Shift+V", "<Control-Shift-V>"),
+}
+
+SHORTCUTS = _SHORTCUTS_WIN if sys.platform.startswith("win") else _SHORTCUTS_MAC
 
 ORIENTATION_SHORTCUT_NAMES = {1: "selce", 2: "selis", 3: "selcp"}
 
 ORIENTATIONS = {
-    "Sample (CE)": 1,
+    "Sample (SC)": 1,
     "In situ (IS)": 2,
-    "Tilt cor. (CP)": 3,
+    "Tilt cor. (TC)": 3,
 }
 
 
@@ -152,7 +244,7 @@ class StarmacApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Starmac_AWE_4.0 - Paleomagnetism")
-        self.root.geometry("1100x700")
+        self._maximize_window()
 
         self.donnees = []  # Stockage des données d'échantillons (List[Pmag])
         self.selection = []  # Dernière sélection (List[SelectedSample])
@@ -161,7 +253,7 @@ class StarmacApp:
         self._archived_ids = None  # cache des `c` deja utilises dans results_path (voir _save_result)
         self._arm_holder_background = None  # equivalent xholarm/yholarm/zholarm (holderarm), pour Anisotropy
         self.entete = ""  # Préfixe de sélection (equivalent selentete)
-        self.orientation = tk.IntVar(value=2)  # equivalent iorient (CE/IS/CP) - defaut In situ
+        self.orientation = tk.IntVar(value=2)  # equivalent iorient (SC/IS/TC) - defaut In situ
         self._current_graphic = None  # ("zijderveld", sample_id) / ("stereo"|"xygraph"|"susceptibility"|"arai", None)
         self._arai_state = None  # (ech, points, checks, arno, fit_ou_None, hlab) pour kind=="arai"
         self._paleoint_review_state = None  # (ech, points, checks, arno, fit) pour kind=="paleoint_review"
@@ -211,6 +303,31 @@ class StarmacApp:
         # le mecanisme d'activation macOS reel, hors de Tk. Peut demander
         # une autorisation "Automatisation" la premiere fois (a accepter).
         self.root.after(200, self._activate_window)
+
+    def _maximize_window(self):
+        """Demarre en fenetre maximisee (occupant tout l'ecran disponible,
+        SANS masquer la barre de menus - contrairement a un vrai plein
+        ecran) - demande explicite utilisateur ("optimize the size of the
+        window to full screen but access to the main menu. The user can
+        reduce it if needed"). `state('zoomed')` est fiable sous Windows/
+        Linux mais INEXISTANT sous Tk/Aqua (macOS) - repli la sur la taille
+        d'ecran effective (winfo_screenwidth/height), qui laisse
+        naturellement la barre de menus macOS (hors fenetre Tk) accessible.
+        L'utilisateur reste libre de redimensionner/deplacer la fenetre
+        ensuite (aucune contrainte imposee apres ce point de depart)."""
+        try:
+            if sys.platform.startswith("win"):
+                self.root.state("zoomed")
+                return
+            if sys.platform.startswith("linux"):
+                self.root.attributes("-zoomed", True)
+                return
+        except tk.TclError:
+            pass
+        self.root.update_idletasks()
+        w = self.root.winfo_screenwidth()
+        h = self.root.winfo_screenheight()
+        self.root.geometry(f"{w}x{h}+0+0")
 
     def _activate_window(self):
         self.root.attributes("-topmost", True)
@@ -265,13 +382,18 @@ class StarmacApp:
         file_menu.add_command(label="Import Utrecht/PMAG2 .col to .prmag format...",
                                command=self.ouvrir_convert_utrecht_to_r_dialog)
         file_menu.add_separator()
+        file_menu.add_command(label="Orientation: field notes orientation to prmag file...",
+                               command=self.ouvrir_field_notes_dialog)
+        file_menu.add_command(label="Create prmag from AGICO .ged file...",
+                               command=self.ouvrir_ged_to_prmag_dialog)
         file_menu.add_command(label="Complete sample information...", command=self.ouvrir_complete_sample_info_dialog)
-        file_menu.add_command(label="Archive new lab data...", command=self.ouvrir_archive_new_data_dialog)
+        file_menu.add_command(label="Archive new laboratory measurements", command=self.ouvrir_archive_new_data_dialog)
         file_menu.add_separator()
-        file_menu.add_command(label="export to Magic from Starmac_Py", command=self.ouvrir_export_magic_dialog)
+        file_menu.add_command(label="export to Magic database", command=self.ouvrir_export_magic_dialog)
         file_menu.add_separator()
         file_menu.add_command(label="export pmag content as a text file", command=self.ouvrir_export_detailed_dialog)
         file_menu.add_command(label="export pmag content as a LaTeX file", command=self.ouvrir_export_latex_dialog)
+        file_menu.add_command(label="export results to Stereo_Py...", command=self.ouvrir_export_stereo_dialog)
         file_menu.add_separator()
         file_menu.add_command(label=self._labeled("Quit Starmac", "starend"), command=self.root.quit)
         menubar.add_cascade(label="PmagFile", menu=file_menu)
@@ -313,43 +435,43 @@ class StarmacApp:
 
         # Menu Results (regroupe ce qui etait eparpille entre Pmag
         # data/Calcul/Graphics - demande explicite utilisateur : "adding a
-        # menu Results and another Paleointensity"). "data+interpretation"
-        # y va (pas dans Paleointensity) - demande explicite utilisateur :
-        # "data+interpretation concerne les vecteurs et va dans results".
+        # menu Results and another Paleointensity"). "Stereo Results"/
+        # "data+interpretation" en sont ressortis vers Graphics dans une
+        # reorganisation ulterieure (liste de menus/raccourcis fournie
+        # explicitement par l'utilisateur).
         results_menu = tk.Menu(menubar, tearoff=0)
         results_menu.add_command(label=self._labeled("Select results...", "selres"),
                                   command=self.ouvrir_selres_dialog)
         results_menu.add_command(label=self._labeled("List results", "lisres"), command=self.lister_resultats)
         results_menu.add_command(label=self._labeled("Init results", "initres"),
                                   command=self.reinitialiser_resultats)
+        results_menu.add_command(label="Delete results...", command=self.ouvrir_delete_results_dialog)
         results_menu.add_separator()
         results_menu.add_command(label=self._labeled("best lines...", "ajuslig"),
                                   command=self.ouvrir_ajuslig_dialog)
         results_menu.add_command(label="best lines auto", command=self.ouvrir_ajusligauto_dialog)
         results_menu.add_command(label="best planes...", command=self.ouvrir_ajusplans_dialog)
-        results_menu.add_command(label="best dir Fisher...", command=self.ouvrir_ajusfisher_dialog)
+        results_menu.add_command(label=self._labeled("best dir Fisher...", "ajusfisher"), command=self.ouvrir_ajusfisher_dialog)
         results_menu.add_command(label="Best fit from redo file...", command=self.ouvrir_ajusligredo_dialog)
         results_menu.add_command(label="Auto-interpret (suggest components)...", command=self.ouvrir_autointerpretation_dialog)
         results_menu.add_separator()
         results_menu.add_command(label="Evaluate interpretations...", command=self.evaluer_interpretations)
         results_menu.add_command(label=self._labeled("Fisher results", "fishres"), command=self.fisher_resultats)
-        results_menu.add_separator()
-        results_menu.add_command(label="Stereo Results", command=self.afficher_stereo_results)
-        results_menu.add_command(label="data+interpretation", command=self.afficher_visres)
         menubar.add_cascade(label="Results", menu=results_menu)
 
         # Menu Paleointensity (demande explicite utilisateur : "view
         # paleoint va dans le menu paleointensite"). GRM va dans Calcul
-        # ("Mettre GRM dans calcul"), Test Induite retire du menu
-        # ("supprimer test induite" - fonction conservee dans le code,
-        # simplement plus exposee par un intitule de menu).
+        # ("Mettre GRM dans calcul"), Test Induite et ConvertZ- 2G retires
+        # du menu ("supprimer test induite" / "remove the convert Z - 2G
+        # menu" - fonctions conservees dans le code, simplement plus
+        # exposees par un intitule de menu).
         paleoint_menu = tk.Menu(menubar, tearoff=0)
-        paleoint_menu.add_command(label="Paleointensity...", command=self.afficher_arai)
-        paleoint_menu.add_command(label="View Paleoint Results...", command=self.ouvrir_openfilepint_dialog)
+        paleoint_menu.add_command(label="Paleointensity interpretation", command=self.afficher_arai)
+        paleoint_menu.add_command(label="View batch of Paleoint Results...", command=self.ouvrir_openfilepint_dialog)
         paleoint_menu.add_separator()
         paleoint_menu.add_command(label="Thellier >> NRM", command=self.ouvrir_convertthelli_dialog)
-        paleoint_menu.add_command(label="Remove step", command=self.ouvrir_removestep_dialog)
-        paleoint_menu.add_command(label="ConvertZ- 2G", command=self.ouvrir_convzmoins_dialog)
+        paleoint_menu.add_command(label="Remove paleointensity step", command=self.ouvrir_removestep_dialog)
+        paleoint_menu.add_command(label="Remove bad-quality (b) steps...", command=self.ouvrir_remove_bad_quality_dialog)
         paleoint_menu.add_command(label="export to ThellierTool...", command=self.ouvrir_exportthellier_dialog)
         paleoint_menu.add_separator()
         paleoint_menu.add_command(label="Cooling rate...", command=self.ouvrir_cooling_rate_dialog)
@@ -362,10 +484,11 @@ class StarmacApp:
         # SAUF "Orientation drill cores"/"Orient Core with LowTemp" (lies a
         # l'option Drillcore, retiree de l'appli).
         calcul_menu = tk.Menu(menubar, tearoff=0)
-        calcul_menu.add_command(label=self._labeled("Fisher data", "fishmes"), command=self.fisher_mesures)
+        calcul_menu.add_command(label=self._labeled("Fisher measures", "fishmes"), command=self.fisher_mesures)
+        calcul_menu.add_command(label=self._labeled("Fisher results", "fishres"), command=self.fisher_resultats)
         calcul_menu.add_separator()
         calcul_menu.add_command(label="MdF-MdT", command=self.afficher_mdf)
-        calcul_menu.add_command(label="Mean Intensity", command=self.afficher_mean_intensity)
+        calcul_menu.add_command(label=self._labeled("Mean Intensity", "meanint"), command=self.afficher_mean_intensity)
         calcul_menu.add_command(label="Koenigsberger ratio...", command=self.ouvrir_koenigsberger_dialog)
         calcul_menu.add_separator()
         calcul_menu.add_command(label="Mean Inclination", command=self.afficher_mean_inclination)
@@ -375,20 +498,27 @@ class StarmacApp:
         calcul_menu.add_command(label="Subtraction...", command=self.ouvrir_subtraction_dialog)
         calcul_menu.add_command(label="Autoinverse", command=lambda: self._not_implemented("Autoinverse"))
         calcul_menu.add_separator()
-        calcul_menu.add_command(label="Anisotropy", command=self.ouvrir_anisotropy_dialog)
+        calcul_menu.add_command(label=self._labeled("Anisotropy", "anisotropy"), command=self.ouvrir_anisotropy_dialog)
+        calcul_menu.add_command(label="Anisotropy PmagPy...", command=self.ouvrir_anisotropy_pmagpy_dialog)
         calcul_menu.add_command(label="Holder_ARM...", command=self.ouvrir_holderarm_dialog)
         calcul_menu.add_command(label="Inverse_ANI_correction...", command=self.ouvrir_inverseani_dialog)
         calcul_menu.add_separator()
+        calcul_menu.add_command(label="Detect GRM...", command=self.ouvrir_detect_grm_dialog)
         calcul_menu.add_command(label="Suppress GRM", command=self.ouvrir_elimine_grm_dialog)
         menubar.add_cascade(label="Calcul", menu=calcul_menu)
 
-        # Menu Graphics
+        # Menu Graphics - "Stereo Results"/"data+interpretation" y sont
+        # entres depuis Results (liste de menus/raccourcis fournie
+        # explicitement par l'utilisateur).
         graph_menu = tk.Menu(menubar, tearoff=0)
         graph_menu.add_command(label=self._labeled("Zijderveld", "plotzijder"), command=self.afficher_zijderveld)
-        graph_menu.add_command(label="Stereo data", command=self.afficher_stereo)
+        graph_menu.add_command(label=self._labeled("Stereo data", "stereodata"), command=self.afficher_stereo)
         graph_menu.add_command(label=self._labeled("XYgraph", "xygraph"), command=self.afficher_xygraph)
-        graph_menu.add_command(label="Susceptibility", command=self.afficher_susceptibilite)
+        graph_menu.add_command(label=self._labeled("Susceptibility", "suscep"), command=self.afficher_susceptibilite)
         graph_menu.add_command(label="Plot IRM", command=self.afficher_irm)
+        graph_menu.add_separator()
+        graph_menu.add_command(label=self._labeled("Stereo Results", "stereores"), command=self.afficher_stereo_results)
+        graph_menu.add_command(label="data+interpretation", command=self.afficher_visres)
         graph_menu.add_separator()
         graph_menu.add_command(label="Clear Screen", command=self.clear_screen)
         graph_menu.add_separator()
@@ -398,11 +528,14 @@ class StarmacApp:
         self.root.config(menu=menubar)
 
     def _setup_shortcuts(self):
-        """Raccourcis clavier globaux (voir SHORTCUTS). Tous utilisent Command
-        comme modificateur de base (jamais Control seul), donc aucun conflit
-        avec les raccourcis d'edition Emacs integres a Tk pour les widgets
-        Entry/Text (Control+E, Control+D... eux sont en Control seul) : pas
-        besoin d'ignorer les raccourcis selon le widget qui a le focus."""
+        """Raccourcis clavier globaux (voir SHORTCUTS/_SHORTCUTS_MAC/
+        _SHORTCUTS_WIN). Sur Mac, tous utilisent Command comme modificateur
+        de base (jamais Control seul) ; sur Windows/Linux, tous utilisent
+        Ctrl+Shift (jamais Ctrl seul) - dans les deux cas, aucun conflit avec
+        les raccourcis d'edition Emacs integres a Tk pour les widgets Entry/
+        Text (Control+E, Control+D... eux sont en Control seul), ni avec les
+        raccourcis universels Windows (Ctrl+S/F/Z/Y/A...) : pas besoin
+        d'ignorer les raccourcis selon le widget qui a le focus."""
         bindings = {
             "importpc": self.ouvrir_fichier_ren,
             "starend": self.root.quit,
@@ -423,6 +556,12 @@ class StarmacApp:
             "initres": self.reinitialiser_resultats,
             "plotzijder": self.afficher_zijderveld,
             "xygraph": self.afficher_xygraph,
+            "stereodata": self.afficher_stereo,
+            "stereores": self.afficher_stereo_results,
+            "ajusfisher": self.ouvrir_ajusfisher_dialog,
+            "suscep": self.afficher_susceptibilite,
+            "meanint": self.afficher_mean_intensity,
+            "anisotropy": self.ouvrir_anisotropy_dialog,
         }
         for name, callback in bindings.items():
             _, sequence = SHORTCUTS[name]
@@ -717,12 +856,12 @@ class StarmacApp:
                 )
 
             if announce:
-                messagebox.showinfo(
+                self._showinfo(
                     "Success", f"{len(self.donnees)} sample(s) loaded!"
                 )
             return True
         except Exception as e:
-            messagebox.showerror("Error", f"Could not read the file:\n{e}")
+            self._showerror("Error", f"Could not read the file:\n{e}")
             return False
 
     def ouvrir_convert_legacy_dialog(self):
@@ -800,21 +939,31 @@ class StarmacApp:
             nb, unmatched, code_anomalies, skipped_multi_suffix = convert_legacy_auto(
                 old_path, complement_path, ren_path)
         except Exception as e:
-            messagebox.showerror("Error", f"Conversion failed:\n{e}")
+            self._showerror("Error", f"Conversion failed:\n{e}")
             return
 
         legacy_results_path = base + ".r"
         try:
-            nb_prmag, nb_results = convert_ren_to_r_file(
+            nb_prmag, nb_results, results_warnings = convert_ren_to_r_file(
                 ren_path, prmag_path, legacy_results_path=legacy_results_path)
         except Exception as e:
-            messagebox.showerror("Error", f"Conversion to .prmag failed:\n{e}")
+            self._showerror("Error", f"Conversion to .prmag failed:\n{e}")
             return
 
         msg = f"Converted: {nb} sample(s) -> {ren_path}\n"
         msg += f"Converted: {nb_prmag} sample(s) -> {prmag_path}\n"
         if nb_results:
-            msg += f"Converted: {nb_results} result(s) -> {results_path_for(prmag_path)}\n"
+            msg += (
+                f"Converted: {nb_results} result(s) -> {results_path_for(prmag_path)} "
+                f"(anti-collision id renumbered as <specimen>_<letter>)\n"
+            )
+        if results_warnings:
+            msg += f"WARNING: {len(results_warnings)} site mean(s) with an incomplete codes list:\n"
+            for w in results_warnings[:20]:
+                msg += f"  - {w}\n"
+            if len(results_warnings) > 20:
+                msg += f"  ... and {len(results_warnings) - 20} more (see console).\n"
+                print("\n".join(results_warnings))
         missing_info_path = None
         if unmatched:
             # Liste COMPLETE des echantillons (sample, pas specimen - un
@@ -884,7 +1033,7 @@ class StarmacApp:
         if skipped_multi_suffix:
             info += (f"\n{len(skipped_multi_suffix)} specimen(s) NOT imported (multi-character suffix)."
                       f"\nFull list: {skipped_path}")
-        messagebox.showinfo("Conversion complete", info)
+        self._showinfo("Conversion complete", info)
 
     def ouvrir_complete_sample_info_dialog(self):
         """Complete les metadonnees Site/Formation/Age/GC/SMT/Li/Loc/Obs
@@ -894,18 +1043,22 @@ class StarmacApp:
         with data in a table"), suite du "we can build a routine to
         complete the sample information later on" evoque lors du passage
         a un import legacy "as-is" (voir complete_sample_info.py pour le
-        detail exact des deux modes et le format de table attendu).
+        detail exact des trois modes et le format de table attendu).
+        Mode 'h' (sample/height) ajoute a la demande explicite utilisateur
+        ("add a specific case for stratigraphic_height filled from sample
+        and height as all specimens have the same height").
         Patche le .prmag EN PLACE (une sauvegarde .bak est ecrite avant
         toute modification, une seule fois)."""
         self.text_area.insert(tk.END, "\n--- Complete sample information (Escape to cancel) ---\n", "prompt")
         mode = self._console_input(
             "Table indexed by site (assumes specimen/sample/site already correct) (s) "
-            "/ by specimen (also fills sample/site) (p): ", "s")
+            "/ by specimen (also fills sample/site) (p) "
+            "/ by sample, stratigraphic_height only (h): ", "s")
         if mode is None:
             return
         mode = (mode.strip().lower() or "s")[:1]
-        if mode not in ("s", "p"):
-            messagebox.showerror("Error", "Must be 's' (site) or 'p' (specimen).")
+        if mode not in ("s", "p", "h"):
+            self._showerror("Error", "Must be 's' (site), 'p' (specimen) or 'h' (sample/height).")
             return
 
         prmag_path = filedialog.askopenfilename(
@@ -921,11 +1074,11 @@ class StarmacApp:
         if not table_path:
             return
 
-        func = complete_site_info if mode == "s" else complete_specimen_info
+        func = {"s": complete_site_info, "p": complete_specimen_info, "h": complete_sample_height}[mode]
         try:
             n_updated, unmatched = func(prmag_path, table_path)
         except Exception as e:
-            messagebox.showerror("Error", f"Completion failed:\n{e}")
+            self._showerror("Error", f"Completion failed:\n{e}")
             return
 
         msg = f"{os.path.basename(prmag_path)}: {n_updated} specimen(s) updated.\n"
@@ -934,7 +1087,7 @@ class StarmacApp:
             more = f", ... ({len(unmatched) - 20} more)" if len(unmatched) > 20 else ""
             msg += f"No table match ({len(unmatched)}): {shown}{more}\n"
         self._afficher(msg)
-        messagebox.showinfo(
+        self._showinfo(
             "Completion done",
             f"{n_updated} specimen(s) updated in {prmag_path}\n"
             f"(backup: {prmag_path}.bak)"
@@ -968,7 +1121,7 @@ class StarmacApp:
             return
         source = (source.strip().lower() or "r")[:1]
         if source not in ("r", "j"):
-            messagebox.showerror("Error", "Must be 'r' (legacy Rennes) or 'j' (JR6).")
+            self._showerror("Error", "Must be 'r' (legacy Rennes) or 'j' (JR6).")
             return
 
         prmag_path = filedialog.askopenfilename(
@@ -998,16 +1151,16 @@ class StarmacApp:
                 for specimen, mesures in parser(path).items():
                     new_by_specimen.setdefault(specimen, []).extend(mesures)
         except Exception as e:
-            messagebox.showerror("Error", f"Could not read the source file(s):\n{e}")
+            self._showerror("Error", f"Could not read the source file(s):\n{e}")
             return
         if not new_by_specimen:
-            messagebox.showwarning("No data", "No usable measurement found in the selected file(s).")
+            self._showwarning("No data", "No usable measurement found in the selected file(s).")
             return
 
         try:
             n_specimens, n_added, n_dup, unmatched = archive_new_measurements(prmag_path, new_by_specimen)
         except Exception as e:
-            messagebox.showerror("Error", f"Archiving failed:\n{e}")
+            self._showerror("Error", f"Archiving failed:\n{e}")
             return
 
         msg = (
@@ -1020,7 +1173,7 @@ class StarmacApp:
             msg += (f"NOT archived - specimen not found in this .prmag ({len(unmatched)}): "
                     f"{shown}{more}\n")
         self._afficher(msg)
-        messagebox.showinfo(
+        self._showinfo(
             "Archiving done",
             f"{n_added} measurement(s) archived in {prmag_path}\n"
             f"(backup: {prmag_path}.bak)"
@@ -1054,23 +1207,28 @@ class StarmacApp:
         base, _ext = os.path.splitext(path)
         output_path = base + ".prmag"
         try:
-            nb, report, nb_results, nb_means = convert_magic_file(path, output_path)
+            nb, report, nb_results, nb_means, nb_pint, redo_pint_path = convert_magic_file(path, output_path)
         except Exception as e:
-            messagebox.showerror("Error", f"Conversion failed:\n{e}")
+            self._showerror("Error", f"Conversion failed:\n{e}")
             return
         results_msg = (
             f"Converted: {nb_results} result(s) and {nb_means} site mean(s) -> "
             f"{results_path_for(output_path)}\n"
             if (nb_results or nb_means) else ""
         )
-        msg = f"{report}\nConverted: {nb} specimen(s) -> {output_path}\n{results_msg}"
+        pint_msg = (
+            f"Converted: {nb_pint} paleointensity determination(s) -> {redo_pint_path}\n"
+            "(use View Paleoint Results... to replay them)\n"
+            if redo_pint_path else ""
+        )
+        msg = f"{report}\nConverted: {nb} specimen(s) -> {output_path}\n{results_msg}{pint_msg}"
         # Ouvre directement le .prmag converti - demande explicite
         # utilisateur ("ce serait bien d'ouvrir les fichiers convertis a
         # la fin des conversions"). AVANT self._afficher(msg), meme
         # raison que ouvrir_convert_legacy_dialog.
         self._load_data_file(output_path, announce=False)
         self._afficher(msg)
-        messagebox.showinfo("Conversion complete", msg)
+        self._showinfo("Conversion complete", msg)
 
     def ouvrir_convert_utrecht_to_r_dialog(self):
         """Convertit un ou plusieurs fichiers .col d'Utrecht
@@ -1110,7 +1268,7 @@ class StarmacApp:
         try:
             nb, nb_results = convert_utrecht_files(list(paths), output_path)
         except Exception as e:
-            messagebox.showerror("Error", f"Conversion failed:\n{e}")
+            self._showerror("Error", f"Conversion failed:\n{e}")
             return
         sites = ", ".join(sorted({os.path.splitext(os.path.basename(p))[0] for p in paths}))
         msg = (
@@ -1125,7 +1283,192 @@ class StarmacApp:
         # raison que ouvrir_convert_legacy_dialog.
         self._load_data_file(output_path, announce=False)
         self._afficher(msg)
-        messagebox.showinfo("Conversion complete", msg)
+        self._showinfo("Conversion complete", msg)
+
+    def ouvrir_field_notes_dialog(self):
+        """Equivalent GUI de `subroutine orientation` (orient_paleomag.f -
+        demande explicite utilisateur "ajouter le menu field notes to
+        Pmag files. From the field orientations, it prepares the prmag
+        files (check the Fortran file). It also prepares the .ged file
+        for the AGICO instruments"). Voir field_notes.py pour le detail du
+        format d'entree (fichier "simple", REVU a la demande explicite de
+        l'utilisateur pour etre plus rapide a remplir sur le terrain - "the
+        field notes are more like the original file. as we now have the
+        possibility to complete the different fields later, we can have
+        two files (a simple file written following the field trip) and a
+        complement file that can be written later") et des sorties
+        produites :
+
+        - un .prmag (format MODERNE Starmac_Py, mesures vides - un
+          instrument n'a pas encore mesure ces specimens a ce stade) ;
+        - UN SEUL .ged combinant tous les sites pour les instruments AGICO
+          (meme comportement que le Fortran, `unfichierged` code en dur a
+          'Y' - demande explicite utilisateur) ;
+        - un rapport diagnostic (azimut geo/declinaison locale/IGRF par
+          specimen, "err>3/5/10" si l'ecart depasse un seuil - complete le
+          calcul manifestement voulu mais jamais assigne dans le Fortran,
+          `d_err`, variable non initialisee dans le source).
+
+        `tool`/`ellipsoid` ne sont plus dans le fichier "simple" lui-meme
+        (ne variaient pas d'un site a l'autre dans les fichiers reels vus
+        jusqu'ici) - demandes UNE FOIS ici, appliques a tous les sites."""
+        self.text_area.insert(tk.END, "\n--- Field notes to Pmag files (Escape to cancel) ---\n", "prompt")
+        ori_path = filedialog.askopenfilename(
+            title="Select the field notes file",
+            filetypes=[("Field notes", "*.txt *.ori"), ("All files", "*.*")],
+        )
+        if not ori_path:
+            return
+
+        tool = self._console_input(
+            "Orientation tool - ASC (vertical needle, rotating stage) or "
+            "other (pivoting square, fixed stage): ", "ASC")
+        if tool is None:
+            return
+        ellipsoid = self._console_input(
+            "Ellipsoid/datum (WGS84 or other, e.g. SA56): ", "WGS84")
+        if ellipsoid is None:
+            return
+        strati = self._console_input(
+            "Bedding convention - Strikedip (last column already is the "
+            "strike) or Dipdip (last column is the dip direction): ", "Strikedip")
+        if strati is None:
+            return
+        ispec_s = self._console_input("Specimens per core (1, 2 or 3): ", "2")
+        if ispec_s is None:
+            return
+        try:
+            ispec = int(ispec_s)
+        except ValueError:
+            self._showerror("Error", "Must be an integer (1, 2 or 3).")
+            return
+        if ispec not in (1, 2, 3):
+            self._showerror("Error", "Must be 1, 2 or 3.")
+            return
+
+        try:
+            with open(ori_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except Exception as e:
+            self._showerror("Error", f"Could not read the file:\n{e}")
+            return
+
+        sites, warnings = parse_orientation_file(
+            lines, tool=tool or "ASC", ellipsoid=ellipsoid or "WGS84", strati=strati or "Strikedip")
+        if not sites:
+            self._showwarning(
+                "No site found",
+                "No usable site/core data found in this file (see the console "
+                "for details if warnings were printed).",
+            )
+            for w in warnings:
+                print(f"WARNING: {w}")
+            return
+
+        # Fichier complement OPTIONNEL (geologie + carottes ajoutees apres
+        # coup) - meme principe que le complement de
+        # ouvrir_convert_legacy_dialog - demande explicite utilisateur.
+        if messagebox.askyesno(
+            "Complement file",
+            "Provide a complement file (site geology - Formation/Age/... - "
+            "and/or additional cores added after the field trip)?",
+        ):
+            complement_path = filedialog.askopenfilename(
+                title="Select the complement file",
+                filetypes=[("Text", "*.txt"), ("All files", "*.*")],
+            )
+            if complement_path:
+                try:
+                    with open(complement_path, "r", encoding="utf-8", errors="replace") as f:
+                        clines = f.readlines()
+                except Exception as e:
+                    self._showerror("Error", f"Could not read the complement file:\n{e}")
+                    return
+                complement, cwarnings = parse_complement_file(clines)
+                warnings = warnings + cwarnings + apply_complement(sites, complement)
+
+        # Verifie que le utdif enregistre est bien celui qui minimise
+        # l'ecart declinaison locale/IGRF - demande explicite utilisateur
+        # ("one of the most common error is with the UTM dif...").
+        warnings = warnings + check_utdif_for_sites(sites)
+
+        base, _ext = os.path.splitext(ori_path)
+        prmag_path = base + "_pmag.prmag"
+        ged_path = base + ".ged"
+        res_path = base + "_diagnostics.txt"
+
+        records = build_pmag_records(sites, ispec)
+        n_prmag = write_prmag_from_field_notes(records, prmag_path)
+        n_ged = write_ged_file(sites, ispec, ged_path)
+        n_diag = write_diagnostics_report(sites, res_path)
+
+        msg = (
+            f"{len(sites)} site(s), {n_prmag} specimen(s) -> {prmag_path}\n"
+            f"{n_ged} specimen(s) -> {ged_path} (AGICO, all sites combined)\n"
+            f"Diagnostics ({n_diag} core(s), az geo / local declination / IGRF) -> {res_path}\n"
+        )
+        if warnings:
+            msg += f"\n{len(warnings)} warning(s):\n"
+            for w in warnings[:20]:
+                msg += f"  - {w}\n"
+            if len(warnings) > 20:
+                msg += f"  ... and {len(warnings) - 20} more (see console).\n"
+                for w in warnings:
+                    print(f"WARNING: {w}")
+
+        self._load_data_file(prmag_path, announce=False)
+        self._afficher(msg)
+        self._showinfo("Field notes converted", msg)
+
+    def ouvrir_ged_to_prmag_dialog(self):
+        """Cree un .prmag (mesures VIDES) a partir d'un fichier .ged AGICO
+        seul - demande explicite utilisateur ("pourrait on mettre un menu
+        de creation de prmag file a partir d'un fichier agico .ged. et
+        ensuite archive data") : couvre le cas ou seules les field notes
+        BRUTES (le fichier "simple" attendu par `Orientation: field notes
+        orientation to prmag file...`) ne sont pas disponibles, mais un
+        .ged deja produit (par ce meme menu, ou recu d'un collegue, ou
+        exporte par le logiciel de l'instrument AGICO) l'est. Voir
+        field_notes.parse_ged_file pour le detail de ce que le .ged porte
+        (specimen + geometrie SEULEMENT - pas le site/la date/la
+        geologie). Le .prmag cree n'a pas de mesures : l'etape suivante
+        naturelle est `Archive new laboratory measurements` pour y
+        attacher les mesures reelles de l'instrument (qui exige des
+        specimens DEJA presents dans le fichier cible - exactement ce que
+        ce menu prepare)."""
+        self.text_area.insert(tk.END, "\n--- Create prmag from AGICO .ged file (Escape to cancel) ---\n", "prompt")
+        ged_path = filedialog.askopenfilename(
+            title="Select the AGICO .ged file",
+            filetypes=[("AGICO .ged", "*.ged"), ("All files", "*.*")],
+        )
+        if not ged_path:
+            return
+
+        try:
+            records = parse_ged_file(ged_path)
+        except Exception as e:
+            self._showerror("Error", f"Could not read the .ged file:\n{e}")
+            return
+        if not records:
+            self._showwarning("No specimen found", "No usable specimen line found in this .ged file.")
+            return
+
+        base, _ext = os.path.splitext(ged_path)
+        prmag_path = base + "_pmag.prmag"
+        n_prmag = write_prmag_from_field_notes(records, prmag_path)
+
+        msg = (
+            f"{n_prmag} specimen(s) -> {prmag_path}\n"
+            "Only specimen id, core azimuth/dip and bedding strike/dip come "
+            "from the .ged - site, date, geology, volume/mass are left as "
+            "'n.d'/defaults (fill in later with Complete sample "
+            "information...).\n"
+            "Next step: PmagFile -> Archive new laboratory measurements, to "
+            "attach the instrument's actual measurements to these specimens.\n"
+        )
+        self._load_data_file(prmag_path, announce=False)
+        self._afficher(msg)
+        self._showinfo("prmag created from .ged", msg)
 
     def ouvrir_export_magic_dialog(self):
         """Equivalent GUI de `export2magic` ("export Rennes to Magic",
@@ -1139,7 +1482,7 @@ class StarmacApp:
         (testlect.decode_roche) - un echantillon sans site MagIC decode
         n'aura simplement pas de ligne dans sites.txt."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
 
         self.text_area.insert(tk.END, "\n--- export Rennes to Magic (Escape to cancel) ---\n", "prompt")
@@ -1158,6 +1501,39 @@ class StarmacApp:
         if region is None:
             return
 
+        # Anisotropie X/Y/Z (LP-AN-TRM vs LP-AN-IRM) - demande explicite
+        # utilisateur ("anisotropy with code X+,Y+,Z+ X-,Y-,Z- is usually
+        # done by TRM acquisition ... but there are some done with high
+        # field IRM ... ask the user to confirm the kind of anisotropy
+        # experiment when it is dubious? and whether it wants to archive
+        # these data"). classify_anisotropy_experiment tranche seule dans
+        # les cas non-ambigus (companion paleointensite -> trm ; etape >
+        # 700 -> irm) ; sinon on demande specimen par specimen.
+        anisotropy_kind_by_specimen = {}
+        anisotropy_skip = set()
+        for ech in self.selection:
+            if not any(m.cod1 in ("X", "Y", "Z") for m in ech.mesures):
+                continue
+            kind = classify_anisotropy_experiment(ech.mesures)
+            if kind is not None:
+                anisotropy_kind_by_specimen[ech.id] = kind
+                continue
+            archive = self._console_input(
+                f"{ech.id}: anisotropy experiment kind is unclear. "
+                f"Archive this anisotropy data (y/N): ", "N")
+            if archive is None:
+                return
+            if archive.strip().lower() != "y":
+                anisotropy_skip.add(ech.id)
+                continue
+            kind_s = self._console_input(
+                f"{ech.id}: TRM acquisition or high-field IRM anisotropy "
+                f"(trm/irm): ", "trm")
+            if kind_s is None:
+                return
+            anisotropy_kind_by_specimen[ech.id] = (
+                "irm" if kind_s.strip().lower().startswith("i") else "trm")
+
         out_dir = filedialog.askdirectory(title="MagIC output folder (sites/samples/specimens/measurements.txt)")
         if not out_dir:
             return
@@ -1167,9 +1543,11 @@ class StarmacApp:
                 self.selection, self.results, out_dir,
                 lab_analysts=lab_analysts,
                 continent_ocean=continent, country=country, region=region,
+                anisotropy_kind_by_specimen=anisotropy_kind_by_specimen,
+                anisotropy_skip=anisotropy_skip,
             )
         except OSError as e:
-            messagebox.showerror("Error", f"MagIC export failed:\n{e}")
+            self._showerror("Error", f"MagIC export failed:\n{e}")
             return
 
         summary = "\n".join(
@@ -1178,15 +1556,56 @@ class StarmacApp:
 
     def _prompt_magstrat_heights(self):
         """Equivalent du prompt "with magnetostratigraphic data (y/N)"
-        commun a exportpmagren et exporttolatex - lit un fichier "id
-        depth" (positif vers le haut) si l'utilisateur repond oui.
+        commun a exportpmagren et exporttolatex. Utilise en priorite le
+        champ `stratigraphic_height` du .prmag (voir testlect.Pmag.
+        stratigraphic_height) quand au moins un specimen de la selection
+        l'a renseigne - meme logique que ouvrir_lismesdepth_dialog,
+        demande explicite utilisateur ("check for all the functions where
+        depth is used and invite the users to fill this parameter using
+        complement") : plus besoin de (re)fournir un fichier "id depth"
+        externe a chaque export des que l'information vit deja dans le
+        fichier de donnees. Ne pose la question "with magnetostratigraphic
+        data (y/N)" (ancien comportement, fichier externe) que si AUCUN
+        specimen de la selection n'a de position renseignee - et invite
+        alors explicitement a la renseigner une fois pour toutes via
+        `Complete sample information...` plutot que de refournir un
+        fichier a chaque export.
         Retourne None si annule (Échap), sinon un dict {id: depth} (vide
-        si l'utilisateur repond non)."""
+        si aucune position n'est disponible et que l'utilisateur repond
+        non)."""
+        heights = {
+            ech.id: ech.stratigraphic_height
+            for ech in self.selection if ech.stratigraphic_height is not None
+        }
+        if heights:
+            n_missing = len(self.selection) - len(heights)
+            self._afficher(
+                f"Using stratigraphic_height from the .prmag file "
+                f"({len(heights)} specimen(s) with a known position"
+                + (f", {n_missing} without)" if n_missing else ")")
+                + ".\n"
+            )
+            if n_missing:
+                self._afficher(
+                    "Tip: fill in the missing position(s) with PmagFile -> "
+                    "Complete sample information... (specimen mode, "
+                    "'stratigraphic_height' column) so future exports include "
+                    "them automatically.\n"
+                )
+            return heights
+
         cmagstrat = self._console_input("With magnetostratigraphic data (y/N): ", "N")
         if cmagstrat is None:
             return None
         if cmagstrat.strip().lower() != "y":
             return {}
+        self._afficher(
+            "Tip: instead of a one-off height file, you can fill in "
+            "'stratigraphic_height' directly in the .prmag with PmagFile -> "
+            "Complete sample information... - it will then be picked up "
+            "automatically here (and in List and depth...) without asking "
+            "for a file again.\n"
+        )
         path = filedialog.askopenfilename(
             title="Sample/height file (positive upward)",
             filetypes=[("Text", "*.txt *.dat"), ("All files", "*.*")],
@@ -1204,7 +1623,7 @@ class StarmacApp:
                         except ValueError:
                             continue
         except OSError as e:
-            messagebox.showwarning("Error", f"Could not read {path}:\n{e}")
+            self._showwarning("Error", f"Could not read {path}:\n{e}")
         return heights
 
     def ouvrir_export_detailed_dialog(self):
@@ -1218,7 +1637,7 @@ class StarmacApp:
         "n.d" comme le fait déjà le Fortran pour ses propres cas de
         données manquantes."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         self.text_area.insert(tk.END, "\n--- export detailed Rennes (Escape to cancel) ---\n", "prompt")
         location = self._console_input("Main study location (country, region): ", "")
@@ -1236,7 +1655,7 @@ class StarmacApp:
         try:
             export_detailed_txt(self.selection, location, out_path, heights=heights or None)
         except OSError as e:
-            messagebox.showerror("Error", f"Export failed:\n{e}")
+            self._showerror("Error", f"Export failed:\n{e}")
             return
         self._afficher(f"Detailed export written: {out_path}\n")
 
@@ -1249,7 +1668,7 @@ class StarmacApp:
         (`includegraphics{zijder-<id>.pdf}` du Fortran, qui suppose ces
         PDF déjà générés sur disque) n'est pas reproduite."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         self.text_area.insert(tk.END, "\n--- export Latex (Escape to cancel) ---\n", "prompt")
         location = self._console_input("Main study location (country, region): ", "")
@@ -1267,9 +1686,62 @@ class StarmacApp:
         try:
             export_latex(self.selection, location, out_path, results=self.results, heights=heights or None)
         except OSError as e:
-            messagebox.showerror("Error", f"Export failed:\n{e}")
+            self._showerror("Error", f"Export failed:\n{e}")
             return
         self._afficher(f"LaTeX export written: {out_path}\n")
+
+    def ouvrir_export_stereo_dialog(self):
+        """Equivalent GUI de `exportres` (fichiers.f:1203), adapte pour
+        etre DIRECTEMENT compatible avec StereoUtils_Py plutot que de
+        reprendre tel quel le format texte du Fortran d'origine - demande
+        explicite utilisateur ("is it possible to add the export results
+        to Stereo_Py as in the original Fortran with in addition a
+        specific file for the poles", precisee ensuite : "I did not
+        explain that it was with a format compatible to the project in
+        Stereo_Py"). Deux fichiers, DEUX formats DIFFERENTS (voir
+        export_stereo.py) :
+        - le fichier "resultats" est au format "Project" de
+          StereoUtils_Py (menu Project > Load Project...) - directement
+          chargeable tel quel, groupe par site (recalcul de moyenne de
+          Fisher possible via "Fisher Project" dans StereoUtils_Py).
+        - le fichier "_poles" (moyennes de site "mean:" avec VGP + ovale
+          dp/dm) est au format "Data input" (colonnes dec/inc = VGP lon/
+          lat) attendu par "Plot VGPs on Map" - PAS le format "Project"
+          (un pole n'est pas une direction locale)."""
+        if not self.results:
+            self._showwarning("No results", "Run one or more fits first.")
+            return
+        orient_s = self._console_input(
+            "Export directions in-situ (i) or after tilt correction (t) : ", "i")
+        if orient_s is None:
+            return
+        orientation = 3 if orient_s.strip().lower().startswith("t") else 2
+
+        out_path = filedialog.asksaveasfilename(
+            title="Export results to Stereo_Py - Project file",
+            defaultextension=".txt",
+            filetypes=[("Text", "*.txt"), ("All files", "*.*")],
+        )
+        if not out_path:
+            return
+        base, ext = os.path.splitext(out_path)
+        poles_path = f"{base}_poles{ext or '.txt'}"
+
+        n_results = export_results_to_stereo(self.results, out_path, orientation=orientation)
+        n_poles = export_poles_to_stereo(self.results, poles_path)
+
+        msg = (
+            f"{n_results} specimen/mean entrie(s) written to {out_path} "
+            f"(StereoUtils_Py: Project > Load Project...)\n"
+        )
+        if n_poles:
+            msg += (
+                f"{n_poles} site pole(s) (VGP) written to {poles_path} "
+                f"(StereoUtils_Py: Data input, then Pmag_Python > Plot VGPs on Map)\n"
+            )
+        else:
+            msg += "No site mean (\"mean:\") found - no poles file written.\n"
+        self._afficher(msg)
 
     # ------------------------------------------------------------------
     # Graphiques : Zijderveld (equivalent de `plotzijder`/`zijderplot`)
@@ -1303,7 +1775,7 @@ class StarmacApp:
         contrairement au Fortran, pas besoin d'un code d'export separe -
         matplotlib ecrit un SVG directement depuis la Figure affichee."""
         if not self.fig.axes:
-            messagebox.showwarning("No graphic", "Display a graphic first (e.g. Zijderveld).")
+            self._showwarning("No graphic", "Display a graphic first (e.g. Zijderveld).")
             return
 
         sample_id = self._current_graphic[1] if self._current_graphic and self._current_graphic[1] else None
@@ -1320,9 +1792,9 @@ class StarmacApp:
         try:
             self.fig.savefig(path, format="svg")
         except Exception as e:
-            messagebox.showerror("Error", f"SVG export failed:\n{e}")
+            self._showerror("Error", f"SVG export failed:\n{e}")
             return
-        messagebox.showinfo("Export successful", f"Graphic exported:\n{path}")
+        self._showinfo("Export successful", f"Graphic exported:\n{path}")
 
     def afficher_zijderveld(self):
         """Equivalent GUI de la boucle `do i=1,nbech ... call zijder2(...)`
@@ -1332,12 +1804,12 @@ class StarmacApp:
         pour laisser le temps de regarder le diagramme avant de passer au
         suivant (Echap pour arreter la sequence en cours de route)."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
 
         samples = [s for s in self.selection if s.mesures]
         if not samples:
-            messagebox.showwarning("No measurements", "No selected sample has any measurement.")
+            self._showwarning("No measurements", "No selected sample has any measurement.")
             return
 
         for i, ech in enumerate(samples):
@@ -1355,7 +1827,7 @@ class StarmacApp:
     def afficher_stereo(self):
         """Equivalent de `stermes` (stereoplot(0))."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         self._current_graphic = ("stereo", None)
         self._refresh_current_graphic()
@@ -1367,7 +1839,7 @@ class StarmacApp:
         self.results (a charger au prealable via Ajustement... ou
         Select results...)."""
         if not self.results:
-            messagebox.showwarning(
+            self._showwarning(
                 "No results",
                 "No results in memory - run a fit or "
                 "load some via Pmag data > Select results...")
@@ -1378,7 +1850,7 @@ class StarmacApp:
     def afficher_xygraph(self):
         """Equivalent de `xygraph` (courbe de désaimantation)."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         self._current_graphic = ("xygraph", None)
         self._refresh_current_graphic()
@@ -1386,7 +1858,7 @@ class StarmacApp:
     def afficher_susceptibilite(self):
         """Equivalent de `suscep`."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         self._current_graphic = ("susceptibility", None)
         self._refresh_current_graphic()
@@ -1396,10 +1868,10 @@ class StarmacApp:
         cod1='I') - pas dans le Fortran, port des scripts GMT de
         l'utilisateur (Scripts_IRM_GMT), demande explicite."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         if not has_irm_data(self.selection):
-            messagebox.showwarning(
+            self._showwarning(
                 "No IRM data",
                 "No selected sample has an IRM measurement (step code 'I').",
             )
@@ -1425,18 +1897,13 @@ class StarmacApp:
         (code mort cote Fortran - la lecture de susceptibilite y est
         commentee, `sus`/`ql` valent toujours 0)."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
 
         self.text_area.insert(tk.END, "\n--- Arai diagram / paleointensity (Escape to cancel) ---\n", "prompt")
 
-        ani_path = None
-        if self.results_path:
-            ani_path = os.path.splitext(self.results_path)[0] + ".ANI"
-            if not os.path.exists(ani_path):
-                ani_path = os.path.splitext(results_path_for(self.results_path))[0] + ".ANI"
-            if not os.path.exists(ani_path):
-                ani_path = None
+        ani_path = self._find_ani_path()
+        pmagint_path = pmagint_path_for(self.results_path) if self.results_path else None
 
         traite = 0
         for ech in self.selection:
@@ -1501,7 +1968,7 @@ class StarmacApp:
                 try:
                     hlab = float(hlab_s or 0.0)
                 except ValueError:
-                    messagebox.showerror("Error", "Hlab must be a number.")
+                    self._showerror("Error", "Hlab must be a number.")
                     continue
 
             volumasse = 1.0e-3 if ech.norme == "m" else 1.0
@@ -1519,14 +1986,21 @@ class StarmacApp:
             if checks:
                 pt_by_k = {p.k: p for p in points}
                 out.write("\n   results of the ptrm checks\n")
-                out.write("      temp      mom        %atr   ecart/atrt  ecart/atrp\n")
+                # 2 colonnes de temperature distinctes - demande explicite
+                # utilisateur ("you also miss the step at which the ptrm
+                # is done") : `done_at` = pas COURANT ou le controle a ete
+                # physiquement effectue (c.k, voir compute_arai), `target`
+                # = pas revisite par le controle (c.temp) - auparavant
+                # affichees identiques par erreur (les deux calculees a
+                # partir du meme "target").
+                out.write("   done_at  target     mom       %atr   ecart/atrt  ecart/atrp\n")
                 for c in checks:
-                    target = pt_by_k[c.k].temp if c.k in pt_by_k else c.temp
+                    done_at = pt_by_k[c.k].temp if c.k in pt_by_k else c.temp
                     mom = c.xt * arno
                     ecart = c.xt - c.xtptrm
                     ratio = ecart / c.xtptrm if c.xtptrm else 0.0
                     out.write(
-                        f"   {target:4.0f} {c.temp:4.0f}   {mom:9.3E}   {c.xt:6.2f}   "
+                        f"   {done_at:5.0f}  {c.temp:5.0f}   {mom:9.3E}   {c.xt:6.2f}   "
                         f"{ecart:6.2f}      {ratio:6.2f}\n"
                     )
             self._afficher(out.getvalue())
@@ -1550,22 +2024,19 @@ class StarmacApp:
                     else:
                         n1, n2 = 1, len(points)
                 except ValueError:
-                    messagebox.showerror("Error", "Enter two integers (ni nj).")
+                    self._showerror("Error", "Enter two integers (ni nj).")
                     continue
                 if not (1 <= n1 <= n2 <= len(points)) or n2 - n1 < 1:
-                    messagebox.showerror("Error", "Invalid point range (at least 2 points).")
+                    self._showerror("Error", "Invalid point range (at least 2 points).")
                     continue
 
                 fit = fit_arai_line(points, n1, n2, hlab=hlab)
                 direction = fit_arai_direction(points, n1, n2, ech, orientation=1)  # SC forcee, voir compute_arai ci-dessus
                 gamma = 90.0 - points[n2 - 1].winc
+                rf1, rf2 = compute_rf1_rf2(points, n1, n2, nrm0_vector(ech, orientation=1))
 
-                fcor = hcorani = None
-                if ani_path and direction.anchored_specimen_frame is not None:
-                    tensor = read_ani_tensor(ani_path, ech.id, "A0")
-                    if tensor is not None:
-                        fcor = compute_anicor_factor(tensor, direction.anchored_specimen_frame)
-                        hcorani = fit.h * fcor
+                fcor, hcorani, aniso_note, aniso_tensor = self._apply_anisotropy_correction(
+                    ech, ani_path, direction, fit.h)
 
                 # courbure de Paterson (adjustcircle.f95, AraiCurvature) :
                 # appel 1 sur (0,1)+points[1..n2] (utilise dans la ligne de
@@ -1623,7 +2094,43 @@ class StarmacApp:
                     )
                 if direction.dang is not None:
                     res.write(f"\n Lisa Tauxe DANG {direction.dang:6.1f}\n")
-                res.write("(rf1/rf2 not yet ported.)\n")
+
+                # Directions AVANT/APRES correction d'anisotropie - demande
+                # explicite utilisateur ("ce serait bien d'afficher les
+                # directions (anchored not anchored) avant et apres
+                # correction d'anisotropie ; ça donne une idée de la
+                # déviation des directions du champ par l'anisotropie de
+                # la roche"). Seulement si un tenseur A0 a reellement ete
+                # utilise (aniso_tensor non None - donc PAS si le
+                # specimen est deja flaganiso, ni si l'utilisateur a
+                # decline "not satisfactory... anyway?").
+                if aniso_tensor is not None:
+                    corrected_direction = fit_arai_direction_corrected(
+                        points, n1, n2, ech, aniso_tensor, orientation=1)
+                    res.write("\n --- after anisotropy correction (tensor 'A0') ---\n")
+                    if corrected_direction.anchored_dec is not None:
+                        res.write(
+                            f" anchored direction: dec={corrected_direction.anchored_dec:6.1f}  "
+                            f"inc={corrected_direction.anchored_inc:6.1f}  "
+                            f"mad={corrected_direction.anchored_mad:5.1f}\n"
+                        )
+                    if corrected_direction.free_dec is not None:
+                        res.write(
+                            f"free direction:  dec={corrected_direction.free_dec:6.1f}  "
+                            f"inc={corrected_direction.free_inc:6.1f}  "
+                            f"mad={corrected_direction.free_mad:5.1f}\n"
+                        )
+                    dev_anchored = angle_between_vectors(
+                        direction.anchored_specimen_frame, corrected_direction.anchored_specimen_frame)
+                    dev_free = angle_between_vectors(
+                        direction.free_specimen_frame, corrected_direction.free_specimen_frame)
+                    if dev_anchored is not None:
+                        res.write(f" deviation from anisotropy (anchored): {dev_anchored:5.1f} deg\n")
+                    if dev_free is not None:
+                        res.write(f" deviation from anisotropy (free):     {dev_free:5.1f} deg\n")
+
+                if rf1 is not None:
+                    res.write(f" rf1 - rf2 : {rf1:5.2f}  {rf2:5.2f}\n")
                 if crm is not None:
                     res.write("\n temp   mom.crm       temp   mom.2,6       temp   mom.crm\n")
                     ks = list(range(n1, n2 + 1))
@@ -1646,6 +2153,8 @@ class StarmacApp:
                     f"    ccr={fit.ccr:8.5f}  h={fit.h:8.3f}"
                     + (f"     % rcrm={crm.rcrm:7.3f}\n" if crm is not None else "\n")
                 )
+                if aniso_note:
+                    res.write(f"\n{aniso_note}")
                 res.write(
                     "\nNum          t1   t2   N    f       g       q     mad   dang   Hlab"
                     "     b       sb     sb/b     ccr      H      fcor  Hcorani  gamma     k     k_sse\n"
@@ -1662,6 +2171,36 @@ class StarmacApp:
                 )
                 self._afficher(res.getvalue())
 
+                # Meme traitement PmagPy/MagIC parallele que le batch
+                # review (compute_magic_paleointensity) - AJOUTE ici (pas
+                # calcule auparavant dans ce dialogue interactif) pour que
+                # mad/dang/fvds/frac/gap_max/n_ptrm du .pmagint viennent
+                # de la MEME source PmagPy dans les deux dialogues -
+                # demande explicite utilisateur (voir write_pmagint_line).
+                magic_result = None
+                try:
+                    magic_result = compute_magic_paleointensity(
+                        ech, step_first=points[n1 - 1].temp, step_last=points[n2 - 1].temp)
+                    self._afficher(format_magic_paleointensity(magic_result))
+                except Exception as e:
+                    self._afficher(f"MagIC/PmagPy paleointensity: not computed for {ech.id} ({e})\n")
+
+                if pmagint_path:
+                    write_pmagint_line(
+                        pmagint_path, ech.id, points[n1 - 1].temp, points[n2 - 1].temp,
+                        n2 - n1 + 1, fit.f, fit.g, fit.qq, hlab, fit.b, fit.sigma, fit.ccr, fit.h,
+                        mad=(magic_result.mad if magic_result else None),
+                        dang=(magic_result.dang if magic_result else None),
+                        pct_crm=(crm.rcrm if crm is not None else None),
+                        fcor=fcor, hcorani=hcorani,
+                        gamma=gamma, k=curv0.k, k_sse=curv0.sse,
+                        fvds=(magic_result.fvds if magic_result else None),
+                        frac=(magic_result.frac if magic_result else None),
+                        gap_max=(magic_result.gap_max if magic_result else None),
+                        n_ptrm=(magic_result.n_ptrm if magic_result else None),
+                        tensor=aniso_tensor, f1=rf1, f2=rf2,
+                    )
+
                 decision = self._console_input(
                     "Redo (r) / next sample (Enter): ", "")
                 if decision is None:
@@ -1671,7 +2210,7 @@ class StarmacApp:
                 break
 
         if traite == 0:
-            messagebox.showinfo(
+            self._showinfo(
                 "No diagram",
                 "No selected sample has usable paleointensity measurements (N/R/V/P codes).",
             )
@@ -1703,7 +2242,7 @@ class StarmacApp:
         final sur H (`rHfinal=H*corcool`), PAS la correction complete de
         `vitref`/Cooling rate."""
         if not self.donnees:
-            messagebox.showwarning("No data", "Load a .ren file first.")
+            self._showwarning("No data", "Load a .ren file first.")
             return
         list_path = filedialog.askopenfilename(
             title="List file (sample Tmin Tmax [cooling rate])",
@@ -1715,7 +2254,7 @@ class StarmacApp:
             with open(list_path, "r", encoding="iso-8859-1", errors="replace") as f:
                 lines = [l for l in f.read().splitlines() if l.strip() and not l.strip().startswith("!")]
         except OSError as e:
-            messagebox.showerror("Error", f"Could not read {list_path}:\n{e}")
+            self._showerror("Error", f"Could not read {list_path}:\n{e}")
             return
 
         entries = []  # (sample_id, tmin, tmax, cooling)
@@ -1731,16 +2270,11 @@ class StarmacApp:
                 continue
             entries.append((sample_id, tmin, tmax, cooling))
         if not entries:
-            messagebox.showwarning("Empty list", f"No usable entry found in {list_path}.")
+            self._showwarning("Empty list", f"No usable entry found in {list_path}.")
             return
 
-        ani_path = None
-        if self.results_path:
-            ani_path = os.path.splitext(self.results_path)[0] + ".ANI"
-            if not os.path.exists(ani_path):
-                ani_path = os.path.splitext(results_path_for(self.results_path))[0] + ".ANI"
-            if not os.path.exists(ani_path):
-                ani_path = None
+        ani_path = self._find_ani_path()
+        pmagint_path = pmagint_path_for(self.results_path) if self.results_path else None
 
         self.text_area.insert(
             tk.END, "\n--- Rapid view of previous Paleointensity determinations (Escape to quit) ---\n", "prompt")
@@ -1813,6 +2347,19 @@ class StarmacApp:
                 continue
 
             n1 = next((i + 1 for i, p in enumerate(points) if p.temp == tmin), None)
+            # tmin==0 (ou tout tmin <= au premier point disponible) designe
+            # generalement le pas NRM (etape 0) comme borne de depart - ce
+            # pas ne figure jamais dans `points` (compute_arai ne l'utilise
+            # que pour `arno`, jamais comme point du diagramme d'Arai) et
+            # ne matchera donc jamais par egalite exacte - bug reel signale
+            # par l'utilisateur ("on ne peut pas lire le dernier échantillon
+            # de la liste" - en realite le SEUL echantillon de la liste
+            # avec tmin=0, confirme sur kr24_09b6/magic_contribution_19987 :
+            # le premier point disponible demarre a 200degC, jamais 0).
+            # Sans borne anterieure existante, demarrer simplement au
+            # premier point disponible.
+            if n1 is None and points and tmin <= points[0].temp:
+                n1 = 1
             n2 = next((i + 1 for i, p in enumerate(points) if p.temp == tmax), None)
             if n1 is None or n2 is None or n2 - n1 < 1:
                 self._afficher(
@@ -1835,13 +2382,10 @@ class StarmacApp:
             fit = fit_arai_line(points, n1, n2, hlab=hlab)
             direction = fit_arai_direction(points, n1, n2, ech, orientation=1)  # SC forcee, voir compute_arai ci-dessus
             gamma = 90.0 - points[n2 - 1].winc
+            rf1, rf2 = compute_rf1_rf2(points, n1, n2, nrm0_vector(ech, orientation=1))
 
-            fcor = hcorani = None
-            if ani_path and direction.anchored_specimen_frame is not None:
-                tensor = read_ani_tensor(ani_path, ech.id, "A0")
-                if tensor is not None:
-                    fcor = compute_anicor_factor(tensor, direction.anchored_specimen_frame)
-                    hcorani = fit.h * fcor
+            fcor, hcorani, aniso_note, aniso_tensor = self._apply_anisotropy_correction(
+                ech, ani_path, direction, fit.h)
 
             h_final = hcorani if hcorani is not None else fit.h
             if cooling:
@@ -1863,6 +2407,11 @@ class StarmacApp:
                     f" anchored direction: dec={direction.anchored_dec:6.1f}  "
                     f"inc={direction.anchored_inc:6.1f}  mad={direction.anchored_mad:5.1f}\n"
                 )
+            if direction.free_dec is not None:
+                res.write(
+                    f" free direction:     dec={direction.free_dec:6.1f}  "
+                    f"inc={direction.free_inc:6.1f}  mad={direction.free_mad:5.1f}\n"
+                )
             res.write(
                 f" f={fit.f:.3f}  g={fit.g:.3f}  q={fit.qq:.3f}  ccr={fit.ccr:.3f}  "
                 f"h={fit.h:.2f}  % rcrm={crm.rcrm:.1f}\n"
@@ -1873,6 +2422,40 @@ class StarmacApp:
                 + (f"  fcorCool={cooling:.3f}  HcorCool={h_final:.1f}µT" if cooling else "")
                 + f"  gamma={gamma:.1f}  k={curv0.k:.4f}\n"
             )
+            if rf1 is not None:
+                res.write(f" rf1 - rf2 : {rf1:5.2f}  {rf2:5.2f}\n")
+            if aniso_note:
+                res.write(aniso_note)
+
+            # Directions AVANT/APRES correction d'anisotropie - meme
+            # demande explicite utilisateur que dans le dialogue Arai
+            # interactif ("afficher les directions... avant et apres
+            # correction d'anisotropie").
+            if aniso_tensor is not None:
+                corrected_direction = fit_arai_direction_corrected(
+                    points, n1, n2, ech, aniso_tensor, orientation=1)
+                res.write(" --- after anisotropy correction (tensor 'A0') ---\n")
+                if corrected_direction.anchored_dec is not None:
+                    res.write(
+                        f" anchored direction: dec={corrected_direction.anchored_dec:6.1f}  "
+                        f"inc={corrected_direction.anchored_inc:6.1f}  "
+                        f"mad={corrected_direction.anchored_mad:5.1f}\n"
+                    )
+                if corrected_direction.free_dec is not None:
+                    res.write(
+                        f" free direction:     dec={corrected_direction.free_dec:6.1f}  "
+                        f"inc={corrected_direction.free_inc:6.1f}  "
+                        f"mad={corrected_direction.free_mad:5.1f}\n"
+                    )
+                dev_anchored = angle_between_vectors(
+                    direction.anchored_specimen_frame, corrected_direction.anchored_specimen_frame)
+                dev_free = angle_between_vectors(
+                    direction.free_specimen_frame, corrected_direction.free_specimen_frame)
+                if dev_anchored is not None:
+                    res.write(f" deviation from anisotropy (anchored): {dev_anchored:5.1f} deg\n")
+                if dev_free is not None:
+                    res.write(f" deviation from anisotropy (free):     {dev_free:5.1f} deg\n")
+
             self._afficher(res.getvalue())
 
             # Second traitement, PARALLELE et INDEPENDANT du natif Starmac
@@ -1882,12 +2465,33 @@ class StarmacApp:
             # the one from Magic"). Echec attendu et non bloquant pour une
             # partie reelle des specimens (protocoles hors IZZI/Thellier
             # standard, voir paleointensity_magic.py) - la boucle de revue
-            # continue, avec juste une ligne d'explication.
+            # continue, avec juste une ligne d'explication. Calcule AVANT
+            # write_pmagint_line : mad/dang/fvds/frac/gap_max/n_ptrm de ce
+            # fichier viennent de CE resultat PmagPy, pas du calcul natif
+            # (demande explicite utilisateur, voir write_pmagint_line).
+            magic_result = None
             try:
                 magic_result = compute_magic_paleointensity(ech, step_first=tmin, step_last=tmax)
                 self._afficher(format_magic_paleointensity(magic_result))
             except Exception as e:
                 self._afficher(f"MagIC/PmagPy paleointensity: not computed for {ech.id} ({e})\n")
+
+            if pmagint_path:
+                write_pmagint_line(
+                    pmagint_path, ech.id, points[n1 - 1].temp, points[n2 - 1].temp,
+                    n2 - n1 + 1, fit.f, fit.g, fit.qq, hlab, fit.b, fit.sigma, fit.ccr, fit.h,
+                    mad=(magic_result.mad if magic_result else None),
+                    dang=(magic_result.dang if magic_result else None),
+                    pct_crm=crm.rcrm,
+                    fcor=fcor, hcorani=hcorani,
+                    fcor_cool=(cooling if cooling else None), hcor_cool=(h_final if cooling else None),
+                    gamma=gamma, k=curv0.k, k_sse=curv0.sse,
+                    fvds=(magic_result.fvds if magic_result else None),
+                    frac=(magic_result.frac if magic_result else None),
+                    gap_max=(magic_result.gap_max if magic_result else None),
+                    n_ptrm=(magic_result.n_ptrm if magic_result else None),
+                    tensor=aniso_tensor, f1=rf1, f2=rf2,
+                )
 
     def afficher_visres(self):
         """Equivalent GUI de `visres` ("data+interpretation",
@@ -1917,11 +2521,11 @@ class StarmacApp:
         utilisateur ("dans l'option data+interpretation, est-ce possible
         de lister l'évaluation de l'échantillon?")."""
         if not self.results:
-            messagebox.showwarning(
+            self._showwarning(
                 "No results", "No results saved (see Calcul > Ajustement...).")
             return
         if not self.donnees:
-            messagebox.showwarning(
+            self._showwarning(
                 "No data", "Load a .ren file first.")
             return
 
@@ -1941,12 +2545,28 @@ class StarmacApp:
             if r.cat1 == "L":
                 self.fig.set_size_inches(5.5, 8.5, forward=True)
                 build_zijderveld_figure(ech, orientation=self.orientation.get(), fits=[r], fig=self.fig)
+                self._fit_figure_to_data()
+                self._redraw_canvas()
+            elif r.cat1 == "P":
+                # Zijderveld + Stereo Results (grand cercle) cote a cote -
+                # demande explicite utilisateur ("in data+interpretation,
+                # when there is a plane, keep the plot zijderveld+stereo
+                # and plot the great circle on the stereo") - le Fortran
+                # d'origine n'affiche que sterres pour un plan (verifie
+                # contre le source), extension deliberee au-dela de ca.
+                # figure a 2 panneaux : bypass _fit_figure_to_data (memes
+                # raisons que paleoint_review/xygraph/susceptibility/irm -
+                # elle ne sait dimensionner qu'un seul panneau).
+                self.fig.set_size_inches(11.0, 6.0, forward=True)
+                build_zijderveld_stereo_results_figure(
+                    ech, r, orientation=self.orientation.get(), fig=self.fig)
+                self._redraw_canvas()
             else:
                 self.fig.set_size_inches(5.5, 5.5, forward=True)
                 build_stereo_results_figure(
                     [r], orientation=self.orientation.get(), nbech=1, fig=self.fig)
-            self._fit_figure_to_data()
-            self._redraw_canvas()
+                self._fit_figure_to_data()
+                self._redraw_canvas()
 
             dec, inc = _correct_dec_inc(r, self.orientation.get())
             self._afficher(f"{r.id} ({r.cat1}): dec={dec:.1f}  inc={inc:.1f}\n")
@@ -1964,7 +2584,7 @@ class StarmacApp:
                 return
 
         if traite == 0:
-            messagebox.showinfo(
+            self._showinfo(
                 "No displayable result",
                 "No line/plane type result (« mean: » averages are not "
                 "displayed by « data+interpretation », matching the Fortran).",
@@ -1975,7 +2595,7 @@ class StarmacApp:
         la séquence Thellier de chaque échantillon sélectionné en séquence
         NRM/demag simple (cod1='D'), utilisable comme un Zijderveld classique."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         if not messagebox.askyesno(
             "Thellier >> NRM",
@@ -1992,7 +2612,7 @@ class StarmacApp:
         """Equivalent GUI de `removestep` ("Remove step") : supprime toutes
         les lignes d'un palier de démagnétisation pour un échantillon."""
         if len(self.selection) != 1:
-            messagebox.showwarning("Invalid selection", "Select a single sample.")
+            self._showwarning("Invalid selection", "Select a single sample.")
             return
         ech = self.selection[0]
         steps_text = "  ".join(
@@ -2004,7 +2624,7 @@ class StarmacApp:
         try:
             etape = int(etape_s)
         except ValueError:
-            messagebox.showerror("Error", "Must be an integer.")
+            self._showerror("Error", "Must be an integer.")
             return
         if not messagebox.askyesno(
             "Remove step",
@@ -2015,6 +2635,99 @@ class StarmacApp:
         removed = remove_step(ech, etape)
         self._afficher(f"{ech.id}: {removed} measurement(s) removed ({len(ech.mesures)} remaining).\n")
 
+    def ouvrir_remove_bad_quality_dialog(self):
+        """Detecte automatiquement, pour TOUS les echantillons de la
+        selection courante, les etapes marquees qualite 'b' (colonne
+        "quality" du .prmag - voir testlect.Measurement.quality) et les
+        supprime via datatools.remove_bad_quality_steps (meme
+        renumerotation des cod2 R/V/P que "Remove paleointensity step",
+        meme suppression en cascade d'une eventuelle verification pTRM
+        qui se referait a l'etape rejetee) - demande explicite
+        utilisateur ("je voudrais utiliser le critere de qualite b/g
+        dans les donnees pour ne pas prendre en compte cette etape...
+        un des problemes en paleointensite est eventuellement qu'une
+        serie d'echantillons ne soient pas mis correctement dans le
+        four... il faut alors renumeroter les etapes automatiquement et
+        aussi supprimer la PTRM check si elle se refere a l'etape
+        rejetee"). Traite TOUTE la selection en un coup (le cas motivant
+        est justement une SERIE d'echantillons affectee par le meme
+        probleme de four), pas un seul echantillon a la fois."""
+        if not self.selection:
+            self._showwarning("No selection", "Select some samples first.")
+            return
+        preview = []
+        for ech in self.selection:
+            bad_etapes = sorted({
+                m.etape for m in ech.mesures if (m.quality or "g").strip().lower() == "b"
+            })
+            if bad_etapes:
+                preview.append((ech, bad_etapes))
+        if not preview:
+            self._showinfo(
+                "No bad-quality steps",
+                "No measurement marked quality 'b' found in the current selection.")
+            return
+        lines = "\n".join(
+            f"  {ech.id}: step(s) {', '.join(f'{e:g}' for e in bad_etapes)}"
+            for ech, bad_etapes in preview)
+        if not messagebox.askyesno(
+            "Remove bad-quality steps",
+            "The following step(s) are marked quality 'b' and will be removed "
+            "(steps renumbered, any pTRM check referencing them also removed) - "
+            f"irreversible for this session:\n\n{lines}\n\nContinue?",
+        ):
+            return
+        total_removed = 0
+        for ech, _bad_etapes in preview:
+            removed, bad_etapes = remove_bad_quality_steps(ech)
+            total_removed += removed
+            self._afficher(
+                f"{ech.id}: {removed} measurement(s) removed (bad-quality step(s) "
+                f"{', '.join(f'{e:g}' for e in bad_etapes)}), {len(ech.mesures)} remaining.\n"
+            )
+        self._afficher(f"Total: {total_removed} measurement(s) removed across {len(preview)} sample(s).\n")
+
+    def ouvrir_detect_grm_dialog(self):
+        """Diagnostic (PAS de correction - voir "Suppress GRM" juste en
+        dessous, qui ne traite qu'un cas different, voir datatools.py) de
+        contamination par GRM (gyroremanent magnetization) sur un
+        degausser 3 axes EN LIGNE avec le magnetometre - demande explicite
+        utilisateur ("Most laboratories using 3 axis degausser online with
+        the Cryogenic magnetometer... It is often not recognized by users
+        or student... Can you write a test to detect such behavior
+        especially for the Magic database contribution", puis "not during
+        export but as an independant menu, perhaps above suppress GRM").
+        N'empeche rien (pas de blocage d'export) - un signal a inspecter
+        visuellement au Zijderveld, voir datatools.detect_grm pour la
+        methode."""
+        if not self.selection:
+            self._showwarning("No selection", "Select some samples first.")
+            return
+        results = [detect_grm(ech) for ech in self.selection]
+        usable = [r for r in results if r is not None]
+        if not usable:
+            self._afficher(
+                "Detect GRM: no specimen in the selection has enough AF steps on a "
+                "3-axis in-line degausser (instrument code starting with 'C') to run this test.\n"
+            )
+            return
+        flagged = [r for r in usable if r.suspected]
+        lines = "\n".join(
+            f"  {r.specimen}: perp. component reaches {r.max_ratio * 100:.0f}% of NRM at "
+            f"highest AF step (correlation with field: {r.correlation:.2f}, "
+            f"{r.mean_perp_fraction * 100:.0f}% of the deviation is orthogonal to the coil axis)"
+            for r in sorted(flagged, key=lambda r: -r.max_ratio)
+        )
+        if flagged:
+            self._afficher(
+                f"Detect GRM: possible GRM contamination on {len(flagged)}/{len(usable)} "
+                f"specimen(s) checked (AF demagnetization on a 3-axis in-line degausser, "
+                f"component orthogonal to the last coil axis growing with AF field) - "
+                f"inspect the Zijderveld plot before trusting these directions:\n{lines}\n"
+            )
+        else:
+            self._afficher(f"Detect GRM: no contamination suspected on the {len(usable)} specimen(s) checked.\n")
+
     def ouvrir_elimine_grm_dialog(self):
         """Equivalent GUI de `elimineGRM` ("Suppress GRM") : réduit les
         triplets de mesures GRM (cod1='F', cod2 'X','Y','Z' consécutifs)
@@ -2022,7 +2735,7 @@ class StarmacApp:
         axe-par-axe, x du point X / y du point Y / z du point Z ; 2 =
         moyenne simple des 3 points)."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         method_s = self._console_input("Method 1 (axis-by-axis substitution) or 2 (average): ", "1")
         if method_s is None:
@@ -2048,7 +2761,7 @@ class StarmacApp:
         """Equivalent GUI de `convzmoins` ("ConvertZ- 2G") : inverse y/z et
         recode en 'R' les mesures cod1='Z' cod2='-'."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         if not messagebox.askyesno(
             "ConvertZ- 2G",
@@ -2070,7 +2783,7 @@ class StarmacApp:
         écrit un fichier .tdt par échantillon sélectionné, dans un dossier
         choisi par l'utilisateur."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         out_dir = os.path.dirname(self.results_path) if self.results_path else os.getcwd()
         chosen = filedialog.askdirectory(initialdir=out_dir, title="ThellierTool export folder (.tdt)")
@@ -2082,7 +2795,7 @@ class StarmacApp:
                 path = export_thellier_tdt(ech, chosen)
                 written.append(path)
             except OSError as e:
-                messagebox.showerror("Error", f"Export failed for {ech.id}:\n{e}")
+                self._showerror("Error", f"Export failed for {ech.id}:\n{e}")
                 return
         self._afficher("Exported .tdt files:\n" + "\n".join(written) + "\n")
 
@@ -2090,10 +2803,101 @@ class StarmacApp:
     # Aides communes
     # ------------------------------------------------------------------
 
+    def _restore_focus(self):
+        """Apres un popup natif (messagebox), le focus clavier ne revient
+        PAS automatiquement sur la fenetre principale (constate sur macOS/
+        Aqua) - les raccourcis lies via bind_all restent inertes tant qu'on
+        n'a pas clique manuellement dans une fenetre de l'appli - demande
+        explicite utilisateur ("we need to manually click in one of the
+        window before to activate the shortcuts. Is there a way to change
+        this behavior?"). Force le focus sur la fenetre principale, et sur
+        la console texte (cible naturelle de la frappe/des raccourcis)."""
+        self.root.lift()
+        self.root.focus_force()
+        self.text_area.focus_set()
+
+    def _apply_anisotropy_correction(self, ech, ani_path, direction, h_raw):
+        """Equivalent de plotpaleoint2.f:1253-1263 : `anicor` (correction
+        scalaire, voir calcul.compute_anicor_factor) n'est appele QUE si le
+        specimen n'a PAS deja ete corrige via "Inverse_ANI_correction..."
+        (`ech.flaganiso` - qui corrige VECTORIELLEMENT chaque mesure brute,
+        voir calcul.apply_inverse_anisotropy) - `if(ech(inh).flaganiso .eq.
+        .false.)` cote Fortran. Le port precedent ignorait ce garde-fou et
+        appliquait donc systematiquement la correction scalaire, y compris
+        sur des mesures DEJA corrigees vectoriellement - une double
+        correction silencieuse - demande explicite utilisateur ("it is
+        unclear for the user that a correction for anisotropy is done...
+        the whole list of measurement were corrected by the inverse
+        anisotropy tensor and the anisotropy corrected paleointensity was
+        automatically calculated from the same temperature interval. This
+        is not obvious in the text output").
+
+        Retourne (fcor, hcorani, note, tensor) : `note` est une ligne de
+        texte EXPLICITE (absente du Fortran, qui se contentait de remettre
+        fcor/tensor a 0/"none" sans rien signaler de plus clair) indiquant
+        sans ambiguite SI et COMMENT H a ete corrige pour l'anisotropie -
+        a afficher juste apres le resultat principal. `tensor` (calcul.
+        AniTensor, le tenseur A0 BRUT utilise, ou None si aucune
+        correction) est renvoye pour l'archivage .pmagint (voir
+        paleointensity.write_pmagint_line) - evite une seconde lecture du
+        fichier .pmagani pour la meme information."""
+        if getattr(ech, "flaganiso", False):
+            return None, None, (
+                "Anisotropy: measurements already corrected (Inverse_ANI_correction "
+                "applied) - H below is the anisotropy-corrected intensity.\n"
+            ), None
+        if not ani_path or direction.anchored_specimen_frame is None:
+            return None, None, "", None
+        tensor = read_ani_tensor(ani_path, ech.id, "A0")
+        if tensor is None:
+            return None, None, "", None
+
+        if tensor.quality == "b":
+            # demande explicite utilisateur ("in the paleointensity
+            # correction: ask : [id] anisotropy NOT significant (not
+            # satisfactory) - inverse anisotropy correction anyway ?") :
+            # le verdict PmagPy (Hext F-test, persiste dans .pmagani -
+            # voir calcul._PMAGANI_HEADER "quality") indique que ce
+            # tenseur n'est pas distinguable du bruit de mesure - corriger
+            # quand meme reste possible, mais ne doit plus se faire
+            # silencieusement.
+            confirm = self._console_input(
+                f"[{ech.id}] anisotropy NOT significant (not satisfactory) - "
+                f"inverse anisotropy correction anyway? y/N: ", "N")
+            if confirm is None or confirm.strip().lower() != "y":
+                return None, None, (
+                    "Anisotropy: NOT applied (Hext F-test not satisfactory, declined) - "
+                    "H below is the raw (uncorrected) intensity.\n"
+                ), None
+
+        fcor = compute_anicor_factor(tensor, direction.anchored_specimen_frame)
+        hcorani = h_raw * fcor
+        note = (
+            "Anisotropy correction applied (tensor 'A0'"
+            + (", NOT significant - applied anyway" if tensor.quality == "b" else "")
+            + f"): fcor={fcor:.3f}  H (raw)={h_raw:.2f}µT -> Hcorani (corrected)={hcorani:.2f}µT\n"
+        )
+        return fcor, hcorani, note, tensor
+
+    def _showinfo(self, *args, **kwargs):
+        result = messagebox.showinfo(*args, **kwargs)
+        self._restore_focus()
+        return result
+
+    def _showwarning(self, *args, **kwargs):
+        result = messagebox.showwarning(*args, **kwargs)
+        self._restore_focus()
+        return result
+
+    def _showerror(self, *args, **kwargs):
+        result = messagebox.showerror(*args, **kwargs)
+        self._restore_focus()
+        return result
+
     def _not_implemented(self, name):
         """Entree de menu presente dans le Fortran d'origine (StarmacOSX_x.f95,
         menu Calcul) mais pas encore portee en Python."""
-        messagebox.showinfo("Not yet implemented", f"« {name} » has not been ported yet.")
+        self._showinfo("Not yet implemented", f"« {name} » has not been ported yet.")
 
     def _archive_only(self, fit):
         """Equivalent de `call archivres` seul (sans toucher self.results) -
@@ -2105,7 +2909,7 @@ class StarmacApp:
         try:
             _, self._archived_ids = archivres(fit, self.results_path, self._archived_ids)
         except OSError as e:
-            messagebox.showwarning(
+            self._showwarning(
                 "Archiving failed",
                 f"The result is in memory but could not be written to "
                 f"{self.results_path}:\n{e}",
@@ -2122,6 +2926,29 @@ class StarmacApp:
     def _save_results(self, fits):
         for fit in fits:
             self._save_result(fit)
+
+    def _find_ani_path(self):
+        """Retrouve le fichier .pmagani associe (voir calcul.ani_path_for) -
+        essaie d'abord directement depuis self.results_path (le cas normal :
+        .prmag et .pmagres/.pmagani partagent le meme nom de base), puis via
+        results_path_for(self.results_path) au cas ou self.results_path
+        porterait encore le nom du fichier de DONNEES plutot que du fichier
+        de resultats (ancien comportement, garde par securite). Si aucun
+        .pmagani n'existe, retombe sur un ANCIEN .ANI de meme nom de base
+        (retro-compatibilite - "can we import old style .ANI in these
+        pmagani style" : les fichiers .ANI pas encore convertis restent
+        utilisables directement, voir calcul.read_ani_tensor qui dispatche
+        deja par extension). None si rien n'existe."""
+        if not self.results_path:
+            return None
+        for base in (self.results_path, results_path_for(self.results_path)):
+            candidate = ani_path_for(base)
+            if os.path.exists(candidate):
+                return candidate
+            legacy = os.path.splitext(base)[0] + ".ANI"
+            if os.path.exists(legacy):
+                return legacy
+        return None
 
     def _afficher(self, text):
         """Ajoute `text` a la suite du contenu existant (n'efface plus la
@@ -2204,7 +3031,7 @@ class StarmacApp:
 
     def _lister(self, func):
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         buffer = io.StringIO()
         func(self.selection, orientation=self.orientation.get(), out=buffer)
@@ -2219,7 +3046,7 @@ class StarmacApp:
         texte (console), pas de fenetre popup - questions posees les unes
         apres les autres comme le faisait le Fortran d'origine."""
         if not self.donnees:
-            messagebox.showwarning(
+            self._showwarning(
                 "No data",
                 "Load a .ren file or import a MagIC folder first.",
             )
@@ -2242,7 +3069,7 @@ class StarmacApp:
             step_min = int(step_min_s or 0)
             step_max = int(step_max_s or 9999)
         except ValueError:
-            messagebox.showerror("Error", "Step min / Step max must be integers.")
+            self._showerror("Error", "Step min / Step max must be integers.")
             return
 
         demag1, demag2 = self._parse_demag(demag_s)
@@ -2318,7 +3145,7 @@ class StarmacApp:
         self.selection comme `selmes` (voir ouvrir_selection_dialog),
         plutot que de la remplacer."""
         if not self.donnees:
-            messagebox.showwarning(
+            self._showwarning(
                 "No data",
                 "Load a .ren file or import a MagIC file first.",
             )
@@ -2326,7 +3153,7 @@ class StarmacApp:
 
         sites = sorted({p.magic_site.strip() for p in self.donnees if p.magic_site.strip()})
         if not sites:
-            messagebox.showwarning(
+            self._showwarning(
                 "No site", "No sample has a decoded MagIC site (see the « roche » line).")
             return
 
@@ -2347,7 +3174,7 @@ class StarmacApp:
             step_min = int(step_min_s or 0)
             step_max = int(step_max_s or 9999)
         except ValueError:
-            messagebox.showerror("Error", "Step min / Step max must be integers.")
+            self._showerror("Error", "Step min / Step max must be integers.")
             return
 
         demag1, demag2 = self._parse_demag(demag_s)
@@ -2399,7 +3226,7 @@ class StarmacApp:
     def ouvrir_effmes_dialog(self):
         """Equivalent GUI de `effmes`."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
 
         self.text_area.insert(tk.END, "\n--- Delete measurements (Escape to cancel) ---\n", "prompt")
@@ -2423,7 +3250,7 @@ class StarmacApp:
             step_min = int(step_min_s or 0)
             step_max = int(step_max_s or 9000)
         except ValueError:
-            messagebox.showerror("Error", "Step min / Step max must be integers.")
+            self._showerror("Error", "Step min / Step max must be integers.")
             return
 
         demag1, demag2 = self._parse_demag(demag_s)
@@ -2461,31 +3288,66 @@ class StarmacApp:
         self._lister(list_measurements_vrm)
 
     def ouvrir_lismesdepth_dialog(self):
-        """Equivalent GUI de `lismesdepth`."""
+        """Equivalent GUI de `lismesdepth`. Utilise en priorite le champ
+        `stratigraphic_height` du .prmag (voir testlect.Pmag.
+        stratigraphic_height) quand au moins un specimen de la selection
+        l'a renseigne - demande explicite utilisateur ("add an additional
+        variable: stratigraphic_position (or the Magic equivalent)... this
+        field will replace the need to load a file for magnetostratigraphic
+        studies") : plus besoin de fichier externe specimen/depth des que
+        cette information est deja dans le fichier de donnees lui-meme.
+        Ne demande un fichier externe (ancien comportement) que si AUCUN
+        specimen de la selection n'a de position renseignee - garde une
+        voie de secours pour les fichiers plus anciens qui n'ont pas encore
+        ce champ."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
 
-        depth_path = filedialog.askopenfilename(
-            title="Depth file (2 columns: sample_name  depth)",
-            filetypes=[("Text", "*.txt"), ("All files", "*.*")],
-        )
-        if not depth_path:
-            return
-
-        depths = {}
-        try:
-            with open(depth_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        try:
-                            depths[parts[0]] = float(parts[1])
-                        except ValueError:
-                            continue
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not read the depth file:\n{e}")
-            return
+        depths = {
+            ech.id: ech.stratigraphic_height
+            for ech in self.selection if ech.stratigraphic_height is not None
+        }
+        if depths:
+            n_missing = len(self.selection) - len(depths)
+            self._afficher(
+                f"Using stratigraphic_height from the .prmag file "
+                f"({len(depths)} specimen(s) with a known position"
+                + (f", {n_missing} without - shown as -999.0" if n_missing else "")
+                + ").\n"
+            )
+            if n_missing:
+                self._afficher(
+                    "Tip: fill in the missing position(s) with PmagFile -> "
+                    "Complete sample information... (specimen mode, "
+                    "'stratigraphic_height' column) so they show up here too.\n"
+                )
+        else:
+            self._afficher(
+                "Tip: instead of a one-off depth file, you can fill in "
+                "'stratigraphic_height' directly in the .prmag with PmagFile -> "
+                "Complete sample information... - it will then be picked up "
+                "automatically here (and in export detailed/Latex) without "
+                "asking for a file again.\n"
+            )
+            depth_path = filedialog.askopenfilename(
+                title="No stratigraphic_height in this file - depth file (2 columns: sample_name  depth)",
+                filetypes=[("Text", "*.txt"), ("All files", "*.*")],
+            )
+            if not depth_path:
+                return
+            try:
+                with open(depth_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            try:
+                                depths[parts[0]] = float(parts[1])
+                            except ValueError:
+                                continue
+            except Exception as e:
+                self._showerror("Error", f"Could not read the depth file:\n{e}")
+                return
 
         self.text_area.insert(tk.END, "\n--- Expected site direction (Escape to cancel) ---\n", "prompt")
         dec_s = self._console_input("Expected declination (D): ", "0.0")
@@ -2498,7 +3360,7 @@ class StarmacApp:
             expected_dec = float(dec_s or 0.0)
             expected_inc = float(inc_s or 0.0)
         except ValueError:
-            messagebox.showerror("Error", "Declination / Inclination must be numbers.")
+            self._showerror("Error", "Declination / Inclination must be numbers.")
             return
 
         buffer = io.StringIO()
@@ -2512,7 +3374,7 @@ class StarmacApp:
     def afficher_info_echantillons(self):
         """Equivalent GUI de `infoech`."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         self._afficher(sample_info(self.selection))
 
@@ -2528,12 +3390,12 @@ class StarmacApp:
         puis apres chaque ajustement : sauver/refaire/suivant (Y/r/n), au
         lieu de traiter un seul echantillon choisi a l'avance."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
 
         samples = [s for s in self.selection if len(s.mesures) >= 2]
         if not samples:
-            messagebox.showwarning(
+            self._showwarning(
                 "Not enough measurements", "No selected sample has at least 2 measurements.")
             return
 
@@ -2553,7 +3415,7 @@ class StarmacApp:
                 try:
                     jdeb = int(jdeb_s)
                 except ValueError:
-                    messagebox.showerror("Error", "First step must be an integer.")
+                    self._showerror("Error", "First step must be an integer.")
                     continue
                 if jdeb == 0:
                     break  # echantillon suivant, sans ajustement
@@ -2571,16 +3433,16 @@ class StarmacApp:
                     jfin = int(jfin_s)
                     numcomp = int(numcomp_s or 1)
                 except ValueError:
-                    messagebox.showerror("Error", "Last step and component number must be integers.")
+                    self._showerror("Error", "Last step and component number must be integers.")
                     continue
                 if not (1 <= jdeb <= jfin <= len(ech.mesures)):
-                    messagebox.showerror("Error", "Invalid step range.")
+                    self._showerror("Error", "Invalid step range.")
                     continue
                 anchored = ancr_s.strip().lower() != "n"
 
                 fit = fit_line(ech, jdeb, jfin, anchored=anchored, numcomp=numcomp)
                 if fit is None:
-                    messagebox.showwarning(
+                    self._showwarning(
                         "Fit rejected",
                         "MAD > 15° or non-linear trend (linearity test failed).",
                     )
@@ -2634,7 +3496,7 @@ class StarmacApp:
         decroissance a composante unique, faillible sur des composantes
         qui se chevauchent - chaque suggestion reste a valider)."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
 
         self.text_area.insert(tk.END, "\n--- Auto-interpretation (suggestions, Escape to stop) ---\n", "prompt")
@@ -2702,12 +3564,12 @@ class StarmacApp:
         de prompt d'ancrage (le Fortran ancre toujours a l'origine pour un
         plan, aucun choix propose a l'utilisateur)."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
 
         samples = [s for s in self.selection if len(s.mesures) >= 2]
         if not samples:
-            messagebox.showwarning(
+            self._showwarning(
                 "Not enough measurements", "No selected sample has at least 2 measurements.")
             return
 
@@ -2727,7 +3589,7 @@ class StarmacApp:
                 try:
                     jdeb = int(jdeb_s)
                 except ValueError:
-                    messagebox.showerror("Error", "Must be an integer.")
+                    self._showerror("Error", "Must be an integer.")
                     continue
                 if jdeb == 0:
                     break
@@ -2738,10 +3600,10 @@ class StarmacApp:
                 try:
                     jfin = int(jfin_s)
                 except ValueError:
-                    messagebox.showerror("Error", "Must be an integer.")
+                    self._showerror("Error", "Must be an integer.")
                     continue
                 if not (1 <= jdeb <= jfin <= len(ech.mesures)):
-                    messagebox.showerror("Error", "Invalid step range.")
+                    self._showerror("Error", "Invalid step range.")
                     continue
 
                 norm_s = self._console_input("Normalize (Y/n): ", "Y")
@@ -2755,12 +3617,12 @@ class StarmacApp:
                 try:
                     numcomp = int(numcomp_s or 1)
                 except ValueError:
-                    messagebox.showerror("Error", "Must be an integer.")
+                    self._showerror("Error", "Must be an integer.")
                     continue
 
                 fit = fit_plane(ech, jdeb, jfin, normalize=normalize, numcomp=numcomp)
                 if fit is None:
-                    messagebox.showwarning("Fit rejected", "MAD > 25° (poorly defined plane).")
+                    self._showwarning("Fit rejected", "MAD > 25° (poorly defined plane).")
                     continue
 
                 dec, inc = _correct_dec_inc(fit, self.orientation.get())
@@ -2787,7 +3649,7 @@ class StarmacApp:
         (branche 735 du Fortran) pour les echantillons a moins de 3 mesures,
         ou si l'utilisateur choisit un seul step (premier == dernier)."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
 
         for ech in self.selection:
@@ -2822,7 +3684,7 @@ class StarmacApp:
                 try:
                     jdeb = int(jdeb_s)
                 except ValueError:
-                    messagebox.showerror("Error", "Must be an integer.")
+                    self._showerror("Error", "Must be an integer.")
                     continue
                 if jdeb == 0:
                     break
@@ -2833,12 +3695,12 @@ class StarmacApp:
                 try:
                     jfin = int(jfin_s)
                 except ValueError:
-                    messagebox.showerror("Error", "Must be an integer.")
+                    self._showerror("Error", "Must be an integer.")
                     continue
                 if jfin == 0:
                     break
                 if not (1 <= jdeb <= jfin <= len(ech.mesures)):
-                    messagebox.showerror("Error", "Invalid step range.")
+                    self._showerror("Error", "Invalid step range.")
                     continue
 
                 numcomp_s = self._console_input("Component number (1-9): ", "1")
@@ -2847,7 +3709,7 @@ class StarmacApp:
                 try:
                     numcomp = int(numcomp_s or 1)
                 except ValueError:
-                    messagebox.showerror("Error", "Must be an integer.")
+                    self._showerror("Error", "Must be an integer.")
                     continue
 
                 if jfin == jdeb:
@@ -2879,7 +3741,7 @@ class StarmacApp:
         sur la totalite des mesures de chaque echantillon selectionne, meme
         ancrage pour tous, sauvegarde sans confirmation."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
 
         ancr_s = self._console_input(
@@ -2904,7 +3766,7 @@ class StarmacApp:
         directement depuis self.donnees - PAS depuis self.selection, qui
         n'a donc pas besoin d'etre preparee au prealable."""
         if not self.donnees:
-            messagebox.showwarning("No data", "Load a .ren file first.")
+            self._showwarning("No data", "Load a .ren file first.")
             return
 
         path = filedialog.askopenfilename(
@@ -2917,7 +3779,7 @@ class StarmacApp:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
         except Exception as e:
-            messagebox.showerror("Error", f"Could not read the file:\n{e}")
+            self._showerror("Error", f"Could not read the file:\n{e}")
             return
 
         fits = fit_from_redo_file(self.donnees, lines)
@@ -2930,18 +3792,18 @@ class StarmacApp:
     def afficher_mdf(self):
         """Equivalent GUI de `mdf` (calcul.f:519-678)."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         self._afficher(list_mdf(self.selection))
 
     def afficher_mean_intensity(self):
         """Equivalent GUI de `mdi`/`mds` (calcul.f:683-865)."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         mi = compute_mean_intensity(self.selection)
         if mi is None:
-            messagebox.showerror(
+            self._showerror(
                 "Error",
                 "Could not compute (mass/volume mix in the selection, "
                 "or not enough measurements).",
@@ -2954,7 +3816,7 @@ class StarmacApp:
     def ouvrir_koenigsberger_dialog(self):
         """Equivalent GUI de `Koenigs` (calcul.f:3869-3926)."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         valk_s = self._console_input("Reference field for the Koenigsberger ratio (µT): ", "40")
         if valk_s is None:
@@ -2962,10 +3824,10 @@ class StarmacApp:
         try:
             valk = float(valk_s)
         except ValueError:
-            messagebox.showerror("Error", "Must be a number.")
+            self._showerror("Error", "Must be a number.")
             return
         if valk == 0.0:
-            messagebox.showerror("Error", "The reference field cannot be zero.")
+            self._showerror("Error", "The reference field cannot be zero.")
             return
         rows = compute_koenigsberger(self.selection, valk)
         self._afficher(
@@ -2977,18 +3839,18 @@ class StarmacApp:
         """Equivalent GUI de `meaninc` (calcul.f:1011-1129, estimateur de
         McFadden & Reid 1982)."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         r = compute_mean_inclination(self.selection, orientation=self.orientation.get())
         if r is None:
-            messagebox.showerror("Error", "Not enough measurements, or the iteration does not converge.")
+            self._showerror("Error", "Not enough measurements, or the iteration does not converge.")
             return
         self._afficher(format_mean_inclination(r))
 
     def afficher_diff_measurements(self):
         """Equivalent GUI de `diffmes` (dataselect.f:1156-1236)."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         self._afficher(list_diff_measurements(self.selection, orientation=self.orientation.get()))
 
@@ -2998,7 +3860,7 @@ class StarmacApp:
         différence) - operation irréversible sur la sélection en mémoire,
         confirmation demandée."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         if not messagebox.askyesno(
             "Viscosity test",
@@ -3019,7 +3881,7 @@ class StarmacApp:
         puis supprime cette ligne - un seul échantillon a la fois, comme le
         Fortran."""
         if len(self.selection) != 1:
-            messagebox.showwarning(
+            self._showwarning(
                 "Invalid selection", "Select a single sample for the subtraction.")
             return
         ech = self.selection[0]
@@ -3032,7 +3894,7 @@ class StarmacApp:
         try:
             row = int(row_s)
         except ValueError:
-            messagebox.showerror("Error", "Must be an integer.")
+            self._showerror("Error", "Must be an integer.")
             return
         if not messagebox.askyesno(
             "Subtraction",
@@ -3042,7 +3904,7 @@ class StarmacApp:
             return
         err = apply_subtraction(ech, row)
         if err:
-            messagebox.showerror("Error", err)
+            self._showerror("Error", err)
             return
         self._afficher(f"{ech.id}: line {row} subtracted and removed ({len(ech.mesures)} measurements remaining).\n")
 
@@ -3051,7 +3913,7 @@ class StarmacApp:
         les 6 mesures ARM d'un porte-échantillon vide - utile pour une
         future correction dans Anisotropy (non encore porté)."""
         if len(self.selection) != 1:
-            messagebox.showwarning(
+            self._showwarning(
                 "Invalid selection",
                 "Select the single sample corresponding to the empty holder.")
             return
@@ -3065,11 +3927,11 @@ class StarmacApp:
         try:
             ixp, ixm, iyp, iym, izp, izm = (int(v) for v in idx_s.split())
         except ValueError:
-            messagebox.showerror("Error", "Exactly 6 space-separated integers are required.")
+            self._showerror("Error", "Exactly 6 space-separated integers are required.")
             return
         bg = record_arm_holder(ech, ixp, ixm, iyp, iym, izp, izm)
         if bg is None:
-            messagebox.showerror("Error", "One of the line numbers is invalid.")
+            self._showerror("Error", "One of the line numbers is invalid.")
             return
         self._arm_holder_background = bg
         self._afficher(
@@ -3089,6 +3951,16 @@ class StarmacApp:
         Les 14 variantes jackknife (A+/A-/A1-A6/B1-B6) ne sont PAS portees
         (etape ulterieure).
 
+        Calcule aussi PmagPy (anisotropy_magic.compute_aarm_pmagpy) sur la
+        MEME detection de 6 positions, et attache son test F de Hext
+        (sigma/F/F12/F23 + verdict satisfactory/not satisfactory) au
+        tenseur 'A0' avant l'ecriture .pmagani (colonnes sigma/ftest/
+        ftest12/ftest23, jusque-la "n.d" pour ce chemin natif, ET une
+        phrase dans la colonne info) - demande explicite utilisateur
+        ("ajouter le calcul de PmagPy et les erreurs dans pmagani, ainsi
+        que l'estimation dans le comment satisfactory or not
+        satisfactory").
+
         Affiche TOUTE la sequence de calcul dans la fenetre texte, comme
         le fait la console du Fortran d'origine (pas seulement le resultat
         final) - demande explicite de l'utilisateur : les donnees
@@ -3098,13 +3970,13 @@ class StarmacApp:
         verifier qu'un echantillon etait bien oriente lors de l'acquisition
         de la TRM."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         if not self.results_path:
-            messagebox.showwarning(
+            self._showwarning(
                 "No file", "Load a .ren file first (the .ANI file is derived from it).")
             return
-        ani_path = os.path.splitext(self.results_path)[0] + ".ANI"
+        ani_path = ani_path_for(self.results_path)
 
         self.text_area.insert(tk.END, "\n--- Anisotropy (Escape to cancel) ---\n", "prompt")
         auto_s = self._console_input("Automated recognition of the 6 steps? y/N: ", "N")
@@ -3120,7 +3992,7 @@ class StarmacApp:
                 return
             use_zb = use_zb_s.strip().lower() == "y"
 
-        done, skipped = [], []
+        done, skipped, declined = [], [], []
         for ech in self.selection:
             lines = [f"\n--- {ech.id}: {'automated ' if use_auto else ''}calcul of TRM or ARM anisotropy with 6 positions ---"]
             lines.append(
@@ -3150,7 +4022,7 @@ class StarmacApp:
                     if len(idx) != 6 or any(not (1 <= i <= len(ech.mesures)) for i in idx):
                         raise ValueError
                 except ValueError:
-                    messagebox.showerror("Error", "6 valid line numbers are required.")
+                    self._showerror("Error", "6 valid line numbers are required.")
                     skipped.append(ech.id)
                     continue
                 manual_positions = dict(zip(
@@ -3210,15 +4082,135 @@ class StarmacApp:
             lines.append(f"  {t.k12:10.3E}  {t.k22:10.3E}  {t.k23:10.3E}")
             lines.append(f"  {t.k13:10.3E}  {t.k23:10.3E}  {t.k33:10.3E}")
 
-            write_ani_tensor(
-                ani_path, ech, t, positions=result.positions,
+            # PmagPy (Hext 1963 F-test, voir anisotropy_magic.
+            # compute_aarm_pmagpy) sur la MEME detection de 6 positions -
+            # attache sigma/F/F12/F23 + verdict satisfactory/not
+            # satisfactory au tenseur 'A0' (all_tensors[0]) avant
+            # l'ecriture .pmagani - demande explicite utilisateur
+            # ("ajouter le calcul de PmagPy et les erreurs dans pmagani,
+            # ainsi que l'estimation dans le comment satisfactory or not
+            # satisfactory").
+            pmagpy_result = compute_aarm_pmagpy(
+                result.positions, holder=self._arm_holder_background, n_pos=6)
+            a0_tensor = result.all_tensors[0]
+            a0_tensor.n_positions = 6
+            a0_tensor.sigma = pmagpy_result.sigma
+            a0_tensor.ftest = pmagpy_result.f_test
+            a0_tensor.ftest12 = pmagpy_result.f12_test
+            a0_tensor.ftest23 = pmagpy_result.f23_test
+            a0_tensor.f_crit = pmagpy_result.f_crit
+            a0_tensor.quality = pmagpy_result.quality
+            if pmagpy_result.quality == "g":
+                lines.append(
+                    f"PmagPy Hext F-test: F={pmagpy_result.f_test:.2f} "
+                    f"(critical F={pmagpy_result.f_crit:.4f}) -> significant anisotropy (satisfactory)"
+                )
+            elif pmagpy_result.quality == "b":
+                lines.append(
+                    f"PmagPy Hext F-test: F={pmagpy_result.f_test:.2f} "
+                    f"(critical F={pmagpy_result.f_crit:.4f}) -> NOT significant (not satisfactory)"
+                )
+            else:
+                lines.append("PmagPy Hext F-test: not computable (exactly-zero residual)")
+
+            self._afficher("\n".join(lines) + "\n")
+            lines = []
+
+            if pmagpy_result.quality == "b":
+                # demande explicite utilisateur ("if (not satisfactory) is
+                # found, ask the user if he still wants to continue") : le
+                # test F de Hext indique que l'anisotropie n'est pas
+                # distinguable du bruit de mesure - saisir la sauvegarde
+                # quand meme reste possible (l'utilisateur peut avoir de
+                # bonnes raisons, ex. comparaison entre specimens d'un
+                # meme site), mais ne doit plus se faire silencieusement.
+                confirm = self._console_input(
+                    f"[{ech.id}] anisotropy NOT significant (not satisfactory) - "
+                    f"save to .pmagani anyway? y/N: ", "N")
+                if confirm is None or confirm.strip().lower() != "y":
+                    declined.append(ech.id)
+                    self._afficher(f"{ech.id}: not saved (anisotropy not satisfactory).\n")
+                    continue
+
+            write_ani_tensors(
+                ani_path, ech, result.all_tensors, positions=result.positions,
                 trm_evolution_pct=result.trm_evolution_pct or 0.0,
                 deviation_pct=result.deviation_pct,
             )
             done.append(ech.id)
+
+        summary = (
+            f"15 tensor variants (A0/A+/A-/A1/B1/A2/B2/A3/B3/A4/B4/A5/B5/A6/B6, "
+            f"'A0' being the main one) written for {len(done)} sample(s) -> {ani_path}\n"
+        )
+        if skipped:
+            summary += f"Skipped (6 positions not identified): {', '.join(skipped)}\n"
+        if declined:
+            summary += f"Not saved (anisotropy not satisfactory, declined): {', '.join(declined)}\n"
+        self._afficher(summary)
+
+    def ouvrir_anisotropy_pmagpy_dialog(self):
+        """Menu "Anisotropy PmagPy..." - PAS dans le Fortran, demande
+        explicite utilisateur ("I have never been able to figure out how
+        the anisotropy of remanent magnetization is determined in Magic.
+        Can you figure out from the PmagPy tools and add a menu
+        Anisotropy PmagPy"). 2e pipeline PARALLELE (comme le panneau
+        paleointensite PmagPy) appelant le vrai pmagpy (voir
+        anisotropy_magic.py pour le detail de ce qui a ete trouve dans le
+        source pmagpy - `ipmag.get_matrix`/`ipmag.calculate_aniso_
+        parameters`, moindres carres a la Hext 1963 + test de
+        significativite F, absent du calcul natif Starmac).
+
+        Detection des 6 positions IDENTIQUE a "Anisotropy" (detect_six_
+        positions, meme substitution R/V->Z+/Z- si necessaire), avec la
+        MEME ligne de base porte-echantillon optionnelle - affiche le
+        tenseur trace-normalise de pmagpy (`aniso_s`), ses axes
+        principaux (v1/v2/v3), le degre d'anisotropie P et le test F de
+        Hext, cote a cote avec le tenseur natif 'A0' de Starmac pour
+        montrer qu'ils calculent la MEME chose (verifie sur donnees
+        synthetiques - voir anisotropy_magic.py) - pmagpy apportant en
+        plus le test de significativite statistique."""
+        if not self.selection:
+            self._showwarning("No selection", "Select some samples first.")
+            return
+
+        self.text_area.insert(tk.END, "\n--- Anisotropy PmagPy (Escape to cancel) ---\n", "prompt")
+        done, skipped = [], []
+        for ech in self.selection:
+            positions = detect_six_positions(ech)
+            if positions is None:
+                skipped.append(ech.id)
+                self._afficher(
+                    f"{ech.id}: decoding incomplete - could not identify all 6 "
+                    f"positions (X+/X-/Y+/Y-/Z+/Z-).\n"
+                )
+                continue
+
+            starmac = compute_anisotropy_tensor(
+                ech, holder=self._arm_holder_background, positions=positions)
+            pmagpy_result = compute_aarm_pmagpy(
+                positions, holder=self._arm_holder_background, n_pos=6)
+
+            lines = [f"\n--- {ech.id} ---"]
+            if starmac is not None:
+                t = starmac.tensor
+                trace = t.k11 + t.k22 + t.k33
+                lines.append(
+                    f"Starmac 'A0' (raw, physical units): k11={t.k11:.3E}  k22={t.k22:.3E}  "
+                    f"k33={t.k33:.3E}  k12={t.k12:.3E}  k23={t.k23:.3E}  k13={t.k13:.3E}"
+                )
+                if trace:
+                    lines.append(
+                        f"Starmac 'A0' (trace-normalized, for comparison with pmagpy's s "
+                        f"below): s1={t.k11/trace:.5f}  s2={t.k22/trace:.5f}  "
+                        f"s3={t.k33/trace:.5f}  s4(s12)={t.k12/trace:.5f}  "
+                        f"s5(s23)={t.k23/trace:.5f}  s6(s13)={t.k13/trace:.5f}"
+                    )
+            lines.append(format_aarm_pmagpy(ech.id, pmagpy_result))
+            done.append(ech.id)
             self._afficher("\n".join(lines) + "\n")
 
-        summary = f"Tensor 'A0' written for {len(done)} sample(s) -> {ani_path}\n"
+        summary = f"Anisotropy PmagPy: {len(done)} sample(s) processed.\n"
         if skipped:
             summary += f"Skipped (6 positions not identified): {', '.join(skipped)}\n"
         self._afficher(summary)
@@ -3229,20 +4221,18 @@ class StarmacApp:
         .ANI, dérivé du fichier de données comme le fichier .r) à toutes
         les mesures de l'échantillon sélectionné."""
         if len(self.selection) != 1:
-            messagebox.showwarning(
+            self._showwarning(
                 "Invalid selection", "Select a single sample.")
             return
         ech = self.selection[0]
         if getattr(ech, "flaganiso", False):
-            messagebox.showwarning("Already corrected", f"{ech.id} has already been corrected for anisotropy.")
+            self._showwarning("Already corrected", f"{ech.id} has already been corrected for anisotropy.")
             return
         if not self.results_path:
-            messagebox.showwarning(
+            self._showwarning(
                 "No file", "Load a .ren file first (the .ANI file is derived from it).")
             return
-        ani_path = os.path.splitext(self.results_path)[0] + ".ANI"
-        if not os.path.exists(ani_path):
-            ani_path = os.path.splitext(results_path_for(self.results_path))[0] + ".ANI"
+        ani_path = self._find_ani_path() or ani_path_for(self.results_path)
         choice = self._console_input(
             "Correction with 1: TRM tensor (A0)  2: ARM tensor (F0)  3: susceptibility (N0): ", "1")
         if choice is None:
@@ -3257,19 +4247,28 @@ class StarmacApp:
 
         tensor = read_ani_tensor(ani_path, ech.id, code2)
         if tensor is None:
-            messagebox.showerror(
+            self._showerror(
                 "Error", f"No '{code2}' tensor for {ech.id} in {ani_path}.")
             return
         apply_inverse_anisotropy(ech, tensor)
         ech.flaganiso = True
         self._afficher(f"{ech.id}: measurements corrected (inverse of the {code2} tensor).\n")
 
+        # Equivalent de `call lismes` en fin de `inverseani` (plotpaleoint2.f:
+        # 1897) : liste les mesures corrigees (dec/inc recalcules depuis les
+        # x,y,z desormais corriges) - demande explicite utilisateur ("can you
+        # list also the corrected directions after Inverse anisotropy"),
+        # meme format que "List data" (selection.list_measurements).
+        buffer = io.StringIO()
+        list_measurements([ech], orientation=self.orientation.get(), out=buffer)
+        self._afficher("\nCorrected directions:\n" + buffer.getvalue())
+
     def ouvrir_cooling_rate_dialog(self):
         """Equivalent GUI de `vitref` (calcul.f:3461-3625, branche "live") :
         boucle sur la sélection, détection automatique du motif L/Q + R/V
         (sinon saisie manuelle des 5 numéros de ligne)."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
             return
         auto_s = self._console_input("Automated procedure (Y/n): ", "Y")
         if auto_s is None:
@@ -3296,7 +4295,7 @@ class StarmacApp:
                     if len(rows) != 5:
                         raise ValueError
                 except ValueError:
-                    messagebox.showerror("Error", "Exactly 5 integers are required.")
+                    self._showerror("Error", "Exactly 5 integers are required.")
                     continue
 
             result = compute_cooling_rate(ech, *rows)
@@ -3304,38 +4303,178 @@ class StarmacApp:
 
     @staticmethod
     def _format_fisher(stats, title):
+        flip_note = (
+            f" ({stats.n_flipped} direction(s) inverted - antipodal group combine)\n"
+            if stats.n_flipped else "\n"
+        )
         return (
             f"{title}\n"
             "----------------------------------------\n"
-            f"n = {stats.n}\n"
+            f"n = {stats.n}{flip_note}"
             f"Dec = {stats.dec:.1f}   Inc = {stats.inc:.1f}\n"
             f"R = {stats.r:.3f}   k = {stats.k:.1f}\n"
             f"a95 = {stats.a95:.1f}   csd = {stats.csd:.1f}\n"
         )
 
+    def _ask_combine_antipodal(self):
+        """Prompt commun a fisher_mesures/fisher_resultats - voir
+        calcul.combine_antipodal_groups. Defaut 'n' : ne change pas le
+        comportement existant tant que l'utilisateur ne le demande pas
+        explicitement (typiquement une courte section magnetostratigraphique
+        avec un intervalle de polarite minoritaire)."""
+        ans = self._console_input(
+            "Combine antipodal N/R groups before averaging "
+            "(invert the smaller group)? (y/N): ", "n")
+        if ans is None:
+            return None
+        return (ans.strip().lower() or "n").startswith("y")
+
     def fisher_mesures(self):
         """Equivalent GUI de `fishmes`."""
         if not self.selection:
-            messagebox.showwarning("No selection", "Select some samples first.")
+            self._showwarning("No selection", "Select some samples first.")
+            return
+        combine_antipodal = self._ask_combine_antipodal()
+        if combine_antipodal is None:
             return
         try:
-            stats = fisher_from_measurements(self.selection, orientation=self.orientation.get())
+            stats = fisher_from_measurements(
+                self.selection, orientation=self.orientation.get(),
+                combine_antipodal=combine_antipodal)
         except ValueError as e:
-            messagebox.showerror("Error", str(e))
+            self._showerror("Error", str(e))
             return
         self._afficher(self._format_fisher(stats, "Fisher on the selected measurements"))
 
     def fisher_resultats(self):
-        """Equivalent GUI de `fishres` (limité aux résultats de type ligne)."""
+        """Equivalent GUI de `fishres` (limité aux résultats de type ligne).
+        Propose ensuite d'archiver la moyenne calculee comme un resultat
+        "mean:" dans le .pmagres - demande explicite utilisateur ("in
+        fisher results, a mean is calculated for the site, if the user
+        want to archive this mean, this mean needs to be recorded in the
+        .pmagres file") : jusqu'ici cette fonction se contentait
+        d'afficher les statistiques, sans jamais les archiver (seul
+        l'import MagIC produisait des lignes "mean:" - voir
+        calcul.build_site_mean_result)."""
         if not self.results:
-            messagebox.showwarning("No results", "Run one or more line fits first.")
+            self._showwarning("No results", "Run one or more line fits first.")
+            return
+        combine_antipodal = self._ask_combine_antipodal()
+        if combine_antipodal is None:
             return
         try:
-            stats = fisher_from_results(self.results, orientation=self.orientation.get())
+            stats = fisher_from_results(
+                self.results, orientation=self.orientation.get(),
+                combine_antipodal=combine_antipodal)
         except ValueError as e:
-            messagebox.showerror("Error", str(e))
+            self._showerror("Error", str(e))
             return
         self._afficher(self._format_fisher(stats, "Fisher on the results (lines)"))
+        self._archive_fisher_mean(stats, combine_antipodal)
+
+    def _archive_fisher_mean(self, stats, combine_antipodal=False):
+        """Propose d'archiver `stats` (calcule par fisher_resultats) comme
+        un resultat "mean:" - demande le site, la composante de
+        magnetisation (A/B/C..., voir calcul.FitResult.component -
+        JAMAIS deduite de numcomp des resultats individuels, "I think it
+        is best not to use the numcomp of individual samples for the
+        mean"), et cherche lat/lon du site dans self.donnees pour le
+        calcul du VGP (dir_to_vgp).
+
+        Si la moyenne archivee n'est pas deja en coordonnees apres pendage
+        (TC, orientation 3), archive AUSSI automatiquement la moyenne de
+        Fisher recalculee apres correction de pendage, a partir des memes
+        resultats individuels - demande explicite utilisateur ("for site
+        when the bedding_dip is not equal to 0, it is also best to
+        automatically calculate the site-mean result after bedding
+        correction. best to recalculate the fisher from individual
+        results after tilt correction; the user will not need to do
+        it"), etendue ensuite a TOUS les sites meme a pendage nul ("in
+        fact better to do it in all cases even when the dip is zero. It
+        will be easier to have all sites in the same coordinates") : plus
+        de condition sur le pendage, seule l'orientation de la moyenne
+        deja archivee (orientation==3, deja TC) evite un second
+        archivage redondant."""
+        if not self.results_path:
+            self._afficher(
+                "(no .r file for the loaded data - the mean cannot be "
+                "archived; run a fit first, or load a .ren file)\n")
+            return
+        decision = self._console_input(
+            "Archive this mean to the .pmagres file (y/N): ", "n")
+        if decision is None or decision.strip().lower() != "y":
+            return
+
+        # meme regroupement que fisher_from_results (L/f/s + P, PAS
+        # uniquement 'L') - demande explicite utilisateur ("when lines and
+        # planes are selected for a fisher result, use the combined L & P").
+        contributing = [r for r in self.results if r.cat1 in _LINE_LIKE_CAT1 or r.cat1 == "P"]
+        sites = sorted({r.id[:6] for r in contributing})
+        if len(sites) == 1:
+            # un seul site dans les resultats combines -> pas d'ambiguite,
+            # nom attribue automatiquement sans demander confirmation -
+            # demande explicite utilisateur ("by default when there are
+            # results from a single site, it is best to automatically [use]
+            # the name of the site to the mean value").
+            site = sites[0]
+            self._afficher(
+                f"Site name automatically set to « {site} » (single site in the results).\n")
+        else:
+            site = self._console_input("Site name: ", "")
+            if site is None:
+                return
+            site = site.strip()
+            if not site:
+                self._showerror("Error", "A site name is required.")
+                return
+
+        latlon = site_lat_lon_from_donnees(site, self.donnees)
+        if latlon is None:
+            self._afficher(
+                f"(no specimen of site « {site} » found in the loaded data - "
+                "site lat/lon set to 0.0/0.0, the archived VGP will not be "
+                "meaningful)\n"
+            )
+            site_lat, site_lon = 0.0, 0.0
+        else:
+            site_lat, site_lon = latlon
+
+        component = self._console_input(
+            "Magnetization component (A/B/C...): ", "A")
+        if component is None:
+            return
+        component = component or "A"
+
+        orientation = self.orientation.get()
+        mean_fit = build_site_mean_result(
+            stats, contributing, site, orientation,
+            site_lat=site_lat, site_lon=site_lon, component=component,
+        )
+        self._save_result(mean_fit)
+        self._afficher(
+            f"Mean archived: mean: {site}  [component {mean_fit.component}]  "
+            f"n={mean_fit.nb}  dec={mean_fit.dec:.1f}  inc={mean_fit.inc:.1f}  "
+            f"VGP=({mean_fit.par4:.1f},{mean_fit.par5:.1f})\n"
+        )
+
+        if orientation == 3:
+            return
+        try:
+            tc_stats = fisher_from_results(
+                contributing, orientation=3, combine_antipodal=combine_antipodal)
+        except ValueError:
+            return
+        tc_mean = build_site_mean_result(
+            tc_stats, contributing, site, 3,
+            site_lat=site_lat, site_lon=site_lon, component=component,
+        )
+        self._save_result(tc_mean)
+        self._afficher(
+            f"Tilt-corrected mean also automatically archived: mean: {site}  "
+            f"[component {tc_mean.component}]  (TC)  n={tc_mean.nb}  "
+            f"dec={tc_mean.dec:.1f}  inc={tc_mean.inc:.1f}  "
+            f"VGP=({tc_mean.par4:.1f},{tc_mean.par5:.1f})\n"
+        )
 
     def lister_resultats(self):
         """Equivalent GUI de `lisres` (limité aux résultats de type ligne).
@@ -3343,7 +4482,7 @@ class StarmacApp:
         dans ce repère à chaque appel (voir list_results), pas figés dans
         le repère échantillon d'origine."""
         if not self.results:
-            messagebox.showwarning("No results", "Run one or more line fits first.")
+            self._showwarning("No results", "Run one or more line fits first.")
             return
         self._afficher(list_results(self.results, orientation=self.orientation.get(),
                                      donnees=self.donnees))
@@ -3359,7 +4498,7 @@ class StarmacApp:
         ratio de linearite). Les moyennes de site ("mean:") sont ignorees
         (pas un fit ligne/plan)."""
         if not self.results:
-            messagebox.showwarning("No results", "Run one or more line/plane fits first, or load some via Select results...")
+            self._showwarning("No results", "Run one or more line/plane fits first, or load some via Select results...")
             return
         reports = evaluate_results(self.results, self.donnees)
         self._afficher(format_quality_report(reports) + "\n")
@@ -3368,6 +4507,57 @@ class StarmacApp:
         """Equivalent GUI de `initres`."""
         self.results = init_results()
         self._afficher("Results reset - no result saved.\n")
+
+    def ouvrir_delete_results_dialog(self):
+        """Menu "Delete results..." - PAS dans le Fortran (`initres` n'efface
+        que la totalite) - demande explicite utilisateur ("ajouter un menu
+        delete results from the list in memory"). Retire des resultats de
+        self.results (MEMOIRE uniquement - le fichier .pmagres deja archive
+        n'est jamais modifie/reecrit ici), selectionnes par leur numero
+        affiche par "List results" (list_results), pour cibler precisement
+        un ou plusieurs resultats plutot que de tout reinitialiser."""
+        if not self.results:
+            self._showwarning("No results", "No result currently loaded.")
+            return
+        self._afficher(list_results(self.results, orientation=self.orientation.get(),
+                                     donnees=self.donnees))
+        indices_s = self._console_input(
+            "Indices to delete (e.g. 1,3,5-7 - see the numbers above; "
+            "Escape to cancel): ", "")
+        if indices_s is None:
+            return
+        indices_s = indices_s.strip()
+        if not indices_s:
+            return
+
+        to_delete = set()
+        try:
+            for token in indices_s.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                if "-" in token:
+                    a, b = token.split("-", 1)
+                    to_delete.update(range(int(a), int(b) + 1))
+                else:
+                    to_delete.add(int(token))
+        except ValueError:
+            self._showerror("Error", "Invalid index list (use e.g. 1,3,5-7).")
+            return
+
+        n = len(self.results)
+        invalid = sorted(i for i in to_delete if i < 1 or i > n)
+        if invalid:
+            self._showerror("Error", f"Index out of range: {invalid} (1-{n}).")
+            return
+
+        kept = [r for i, r in enumerate(self.results, start=1) if i not in to_delete]
+        n_removed = n - len(kept)
+        self.results = kept
+        self._afficher(
+            f"{n_removed} result(s) removed from memory (the .pmagres file, if "
+            f"already archived, is unaffected) - {len(self.results)} remaining.\n"
+        )
 
     def ouvrir_selres_dialog(self):
         """Equivalent GUI de `selres` (dataselect.f) : charge des resultats
@@ -3378,11 +4568,22 @@ class StarmacApp:
           composante - les moyennes "mean:" sont exclues.
         - Mean : uniquement les moyennes de site, filtrees par orientation
           courante (equivalent `res.par3==float(iorient)`) - pas de filtre
-          type/composante (non demandes par le Fortran dans ce mode).
+          type/composante numerique (non demandes par le Fortran dans ce
+          mode).
         - Site : la/les moyenne(s) matchee(s) PLUS les resultats individuels
-          qui la composent (equivalent `decodelisteres`)."""
+          qui la composent (equivalent `decodelisteres`).
+
+        Filtre supplementaire "component" (A/B/C..., PAS dans le Fortran -
+        voir calcul.FitResult.component) disponible dans les 3 modes :
+        demande explicite utilisateur pour pouvoir selectionner
+        independamment UNE seule moyenne de site (et ses resultats
+        associes en mode Site) quand un meme site porte plusieurs moyennes
+        de composantes de magnetisation differentes ("when there is
+        different components of magnetizations within the same site, we
+        may have two or three means by site... during the select results
+        with m or s, we can also differentiate by component")."""
         if not self.results_path or not os.path.exists(self.results_path):
-            messagebox.showwarning(
+            self._showwarning(
                 "No results file",
                 "No .r file found for the loaded data "
                 "(run a fit first, or load a .ren file)."
@@ -3402,14 +4603,18 @@ class StarmacApp:
             site = self._console_input("Site (name, without « mean: », * = all): ", "*")
             if site is None:
                 return
+            component = self._console_input(
+                "Magnetization component (A/B/C..., * = all): ", "A")
+            if component is None:
+                return
             loaded = load_results(
                 self.results_path, pattern=site or "*", carselect=carselect,
-                iorient=self.orientation.get(),
+                iorient=self.orientation.get(), component=component or "A",
             )
             if not loaded:
                 available = available_mean_orientations(self.results_path, site or "*")
                 if available and self.orientation.get() not in available:
-                    noms = {1: "Sample (CE)", 2: "In situ (IS)", 3: "Tilt cor. (CP)"}
+                    noms = {1: "Sample (SC)", 2: "In situ (IS)", 3: "Tilt cor. (TC)"}
                     self._afficher(
                         "No mean found for the current orientation "
                         f"« {noms.get(self.orientation.get(), self.orientation.get())} » - "
@@ -3432,10 +4637,15 @@ class StarmacApp:
                 try:
                     numcomp = int(numcomp_s)
                 except ValueError:
-                    messagebox.showerror("Error", "The component number must be an integer.")
+                    self._showerror("Error", "The component number must be an integer.")
                     return
+            component = self._console_input(
+                "Magnetization component (A/B/C..., * = all): ", "A")
+            if component is None:
+                return
             loaded = load_results(self.results_path, pattern=pattern or "*",
-                                   carselect="d", cat1=cat1 or "*", numcomp=numcomp)
+                                   carselect="d", cat1=cat1 or "*", numcomp=numcomp,
+                                   component=component or "A")
 
         # tx/ty/tz (segment ajuste, pour le trace sur un Zijderveld) ne sont
         # plus stockes dans le fichier .r (voir calcul.recompute_fit_geometry)
@@ -3443,8 +4653,16 @@ class StarmacApp:
         # seule fois au chargement plutot qu'a chaque affichage - demande
         # explicite utilisateur ("to draw the line on the zijderveld plot we
         # can redo the calculation").
-        self.results = [recompute_fit_geometry(r, self.donnees) for r in loaded]
-        self._afficher(f"nb selected results: {len(loaded)}\n")
+        new_matches = [recompute_fit_geometry(r, self.donnees) for r in loaded]
+        # equivalent de selres (dataselect.f) : accumule sur la selection
+        # existante, comme selmes (voir ouvrir_selection_dialog) - seul
+        # initres/"Init results" remet self.results a zero. Demande
+        # explicite utilisateur ("the selection of results should not
+        # initialize the previous list").
+        self.results = self.results + new_matches
+        self._afficher(
+            f"Selection: +{len(new_matches)} result(s) - "
+            f"total {len(self.results)} result(s)\n")
 
 
 if __name__ == "__main__":
