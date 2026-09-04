@@ -2021,7 +2021,7 @@ class MdfResult:
 _MDF_CODES = {
     "D": ("M.D.T.", "deg C"), "d": ("M.D.T.", "deg C"),
     "S": ("M.D.T.", "deg C"), "s": ("M.D.T.", "deg C"),
-    "F": ("M.D.F.", "oersted"), "f": ("M.D.F.", "oersted"),
+    "F": ("M.D.F.", "mT"), "f": ("M.D.F.", "mT"),
     "N": ("A.R.N.", "......."), "n": ("A.R.N.", "......."),
     "I": ("A.R.I.", "......."), "i": ("A.R.i.", "......."),
 }
@@ -2079,6 +2079,18 @@ def compute_mdf(ech: SelectedSample) -> Optional[MdfResult]:
     demagcod, unite = _MDF_CODES.get(mesures[-1].cod1, ("A.R.N.", "......."))
     if demagcod in ("A.R.N.", "A.R.I.", "A.R.i."):
         return None
+
+    # `steps` (etape brut) est en dixiemes de mT pour un pas AF (convention
+    # historique Oersted - 1 mT = 10 Oe, voir testlect._PRMAG_OERSTED_CODES) :
+    # xmdf1/xmdf2, interpolation LINEAIRE de ces steps, sortent donc dans
+    # cette meme echelle - divise par 10 pour un M.D.F. (AF) afin de
+    # rapporter un vrai MDF en mT, pas un Oersted-equivalent - demande
+    # explicite utilisateur ("remove the historical background in oersted
+    # and now work only the AF in mT... especially if new users are going
+    # to use it"). Sans effet sur un M.D.T. (thermique, etape deja en degC).
+    if demagcod == "M.D.F.":
+        xmdf1 /= 10.0
+        xmdf2 /= 10.0
 
     rapport = xmdf2 / xmdf1 if xmdf1 != 0 else 0.0
     return MdfResult(id=ech.id, demagcod=demagcod, unite=unite,
