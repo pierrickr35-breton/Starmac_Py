@@ -231,6 +231,18 @@ _SHORTCUTS_WIN = {
 
 SHORTCUTS = _SHORTCUTS_WIN if sys.platform.startswith("win") else _SHORTCUTS_MAC
 
+# Marque une ligne de TITRE DE COLONNES ("header" au sens tableau, pas
+# "en-tete de fichier") a l'interieur d'un texte de rapport, pour que
+# StarmacApp._afficher l'affiche en gras - demande explicite utilisateur
+# ("throughout the software, is it possible to write the header in bold,
+# the output text might be easier to read"). Un caractere de controle
+# improbable dans un texte normal (pas de conflit avec les donnees
+# reelles) plutot qu'un marquage par position/regex fragile - chaque
+# fonction de rapport (selection.list_*, calcul.list_results, etc.)
+# entoure sa ligne d'en-tete de colonnes avec HEADER_MARK ; _afficher
+# retire les marqueurs et applique le tag "header" au texte entre eux.
+HEADER_MARK = "\x01"
+
 ORIENTATION_SHORTCUT_NAMES = {1: "selce", 2: "selis", 3: "selcp"}
 
 ORIENTATIONS = {
@@ -285,6 +297,7 @@ class StarmacApp:
         text_xscroll = ttk.Scrollbar(self.text_frame, orient=tk.HORIZONTAL, command=self.text_area.xview)
         self.text_area.configure(yscrollcommand=text_yscroll.set, xscrollcommand=text_xscroll.set)
         self.text_area.tag_configure("prompt", foreground="#c0392b")
+        self.text_area.tag_configure("header", font=("Courier", 14, "bold"))
         self.text_area.grid(row=0, column=0, sticky="nsew")
         text_yscroll.grid(row=0, column=1, sticky="ns")
         text_xscroll.grid(row=1, column=0, sticky="ew")
@@ -2953,10 +2966,21 @@ class StarmacApp:
     def _afficher(self, text):
         """Ajoute `text` a la suite du contenu existant (n'efface plus la
         console a chaque appel de menu), et fait defiler jusqu'au nouveau
-        contenu."""
+        contenu. Les segments entoures de HEADER_MARK (lignes de titres de
+        colonnes des fonctions de rapport - list_measurements, list_results,
+        etc.) sont inseres avec le tag "header" (gras) plutot qu'en texte
+        normal, marqueurs retires - demande explicite utilisateur
+        ("throughout the software, is it possible to write the header in
+        bold")."""
         if self.text_area.get("1.0", "end-1c").strip():
             self.text_area.insert(tk.END, "\n" + "-" * 60 + "\n")
-        self.text_area.insert(tk.END, text)
+        for i, chunk in enumerate(text.split(HEADER_MARK)):
+            if not chunk:
+                continue
+            if i % 2:
+                self.text_area.insert(tk.END, chunk, "header")
+            else:
+                self.text_area.insert(tk.END, chunk)
         self.text_area.see(tk.END)
 
     @staticmethod

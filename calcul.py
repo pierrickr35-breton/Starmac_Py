@@ -20,6 +20,12 @@ from selection import (
 )
 from testlect import Pmag
 
+# Voir app.HEADER_MARK / selection._HEADER_MARK - marque une ligne de
+# titres de colonnes pour un affichage en gras cote console (StarmacApp.
+# _afficher), meme valeur, redefinie localement dans chaque module plutot
+# qu'importee (evite tout couplage sur un nom prive).
+_HEADER_MARK = "\x01"
+
 
 # ---------------------------------------------------------------------------
 # Equivalent de la structure /Resultats/ (starmac_OSX.inc), limite aux
@@ -1088,7 +1094,7 @@ def list_results(results: List[FitResult], orientation: int = 1, donnees=None) -
     tag = _ORIENT_MODE_TAG.get(orientation, "Sa")
     lines = [
         _ORIENT_HEADER.get(orientation, _ORIENT_HEADER[1]),
-        f"     Sample          comp  cat  orig  demag   step1  stepn   nb   dec    inc   mad   ({tag})",
+        f"{_HEADER_MARK}     Sample          comp  cat  orig  demag   step1  stepn   nb   dec    inc   mad   ({tag}){_HEADER_MARK}",
     ]
     for i, r in enumerate(results, start=1):
         dec, inc = _correct_dec_inc(r, orientation)
@@ -2346,7 +2352,7 @@ def compute_koenigsberger(selected: List[SelectedSample], valk: float) -> List[K
 
 
 def format_koenigsberger(rows: List[KoenigsbergerRow]) -> str:
-    lines = ["Sample        step       Mag           K            Koenigsberger ratio"]
+    lines = [f"{_HEADER_MARK}Sample        step       Mag           K            Koenigsberger ratio{_HEADER_MARK}"]
     for r in rows:
         lines.append(
             f"{r.id:<12s}  {r.etape:4d}{r.cod1}{r.cod2}  {r.mag:.3e}  {r.ind_mag:.3e}   {r.ratio:7.3f}"

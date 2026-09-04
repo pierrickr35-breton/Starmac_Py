@@ -17,6 +17,11 @@ from typing import Dict, List, Optional, TextIO, Tuple
 from testlect import Measurement, Pmag
 from orient_sample import compute_local_declination
 
+# Voir app.HEADER_MARK - marque une ligne de titres de colonnes pour un
+# affichage en gras cote console, meme valeur, definie localement pour
+# eviter un import circulaire depuis app.py.
+_HEADER_MARK = "\x01"
+
 
 # ---------------------------------------------------------------------------
 # Equivalent de la structure /Echantillons/ ech(3000) (starmac_OSX.inc)
@@ -195,31 +200,51 @@ def apply_orientation(x: float, y: float, z: float, ech: "SelectedSample", orien
     raise ValueError(f"invalid orientation: {orientation}")
 
 
-def _mag_values(ech: "SelectedSample", mtot: float) -> tuple:
-    """(A/m, Am2/kg) : l'un des deux est None selon ech.norme ('v' ou 'm').
-    Les DEUX sont None si `ech.vol` est manquant (0/None) - ni normalisable
-    en A/m ni en Am2/kg sans volume/masse - demande explicite utilisateur
-    ("when the volume or the mass of the sample is not given, best to show
-    the data in total moment as done in the list") : le Fortran d'origine
-    divisait TOUJOURS par ech.vol sans le verifier. Affiche desormais "--"
-    (voir _fmt_mag) plutot qu'un faux "0.0" - la colonne "Mtot Am2" (deja
-    calculee independamment du volume par l'appelant, ex. list_measurements)
-    reste la seule valeur fiable dans ce cas."""
-    if not ech.vol:
-        return None, None
-    if ech.norme == "m":
-        return None, mtot * 1.0e3 / ech.vol
-    return mtot * 1.0e6 / ech.vol, None
-
-
 def _s_value(ech: "SelectedSample", m: Measurement) -> float:
     if ech.norme == "m":
         return m.s * 1.0e-7 / ech.vol if ech.vol else 0.0
     return m.s * 1.0e-4 / ech.vol if ech.vol else 0.0
 
 
-def _fmt_mag(value: Optional[float]) -> str:
-    return f"{value:10.3E}" if value is not None else "   --     "
+# cod1 -> unite d'etape affichable - meme convention que xygraph._AF_CODES/
+# _THERMAL_CODES et testlect._PRMAG_OERSTED_CODES (etape stockee en dixiemes
+# de mT pour A/F, directement en degC pour D/S/T/K) - limitee a ces deux
+# groupes bien etablis, pas etendue aux codes paleointensite (R/V/P) ni aux
+# autres (I, N...) pour rester coherente avec le reste du code plutot que de
+# deviner une unite non confirmee ailleurs.
+_AF_CODES = {"A", "F"}
+_THERMAL_CODES = {"D", "S", "T", "K"}
+
+
+def _fmt_step(m: "Measurement") -> str:
+    """Affiche l'etape avec son unite quand elle est sans ambiguite (degC
+    pour un pas thermique, mT pour un pas AF - etape stockee en dixiemes de
+    mT pour A/F, voir testlect._PRMAG_OERSTED_CODES) suivie du code - demande
+    explicite utilisateur ("can we clean the list data... 210D+ -> 210 degC
+    D+")."""
+    if m.cod1 in _AF_CODES:
+        return f"{m.etape / 10.0:5.1f} mT {m.cod1}{m.cod2}"
+    if m.cod1 in _THERMAL_CODES:
+        return f"{m.etape:5d} °C {m.cod1}{m.cod2}"
+    return f"{m.etape:5d}    {m.cod1}{m.cod2}"
+
+
+def _selection_norme_labels(selected: List["SelectedSample"]) -> Tuple[str, str]:
+    """(libelle colonne intensite, libelle colonne susceptibilite) -
+    determines depuis la normalisation (volume/masse) REELLEMENT utilisee
+    par la selection, plutot que d'afficher systematiquement les deux
+    unites cote a cote avec un "--" pour celle qui ne s'applique pas -
+    demande explicite utilisateur ("remove Am2/kg if normalization by
+    volume... susceptibility: K (with its unit following the type of
+    normalization)"). Si la selection melange volume ET masse (rare, mais
+    possible), retombe sur le double libelle - la seule situation ou les
+    deux unites peuvent legitimement apparaitre dans la meme liste."""
+    normes = {ech.norme for ech in selected if ech.vol}
+    if normes == {"v"}:
+        return "A/m", "K (SI)"
+    if normes == {"m"}:
+        return "Am2/kg", "K (m3/kg)"
+    return "A/m or Am2/kg", "K (SI or m3/kg)"
 
 
 def normalized_intensity(ech: "SelectedSample", raw_magnitude: float) -> Tuple[float, str]:
@@ -575,14 +600,20 @@ _HEADERS_EN = {
 
 
 def _write_report_header(out: TextIO, idiom: str, orientation: int, columns_fr: str, columns_en: str) -> None:
+    # HEADER_MARK ("\x01") entoure la ligne de titres de colonnes pour que
+    # StarmacApp._afficher (app.py) l'affiche en gras - demande explicite
+    # utilisateur ("throughout the software, is it possible to write the
+    # header in bold"). Meme caractere que app.HEADER_MARK, redefini
+    # localement (pas d'import depuis app.py - creerait une dependance
+    # circulaire, ce module etant importe par app.py, jamais l'inverse).
     if idiom == "F":
         out.write("\n ---- liste mesures selectionnees -----\n")
         out.write(f" {_HEADERS_FR[orientation]}\n")
-        out.write(columns_fr + "\n")
+        out.write(f"{_HEADER_MARK}{columns_fr}{_HEADER_MARK}\n")
     else:
         out.write("\n ---- list selected measurements -----\n")
         out.write(f" {_HEADERS_EN[orientation]}\n")
-        out.write(columns_en + "\n")
+        out.write(f"{_HEADER_MARK}{columns_en}{_HEADER_MARK}\n")
 
 
 def list_measurements(
@@ -592,11 +623,25 @@ def list_measurements(
     out: TextIO = sys.stdout,
 ) -> None:
     """Equivalent de la subroutine `lismes` : imprime les mesures des
-    echantillons selectionnes, avec correction d'orientation optionnelle."""
+    echantillons selectionnes, avec correction d'orientation optionnelle.
+
+    Colonnes nettoyees (demande explicite utilisateur, "can we clean the
+    list data") par rapport a l'ancien format brut Fortran :
+    - "Etape"/"Step" porte maintenant l'unite du pas (degC thermique, mT
+      AF - voir _fmt_step) plutot qu'un code compact "210D+" a decoder.
+    - UNE SEULE colonne d'intensite normalisee (A/m OU Am2/kg, jamais les
+      deux avec un "--" pour celle qui ne s'applique pas) - voir
+      _selection_norme_labels/normalized_intensity.
+    - Susceptibilite relabelee "K", avec son unite suivant elle aussi la
+      normalisation reellement utilisee (SI pour un volume, m3/kg pour une
+      masse) plutot que le double libelle "(s: SI ou m3/kg)" fige.
+    - "Mag" (nom de colonne historique, sans rapport avec la magnetisation -
+      c'etait deja le code INSTRUMENT) renomme "Inst"."""
+    mag_label, k_label = _selection_norme_labels(selected)
     _write_report_header(
         out, idiom, orientation,
-        "       Numero      Etape      Mtot Am2      A/m    Am2/kg   Dec    Inc    q  Mag   (s: SI   ou m3/kg)",
-        "       Sample       Step      Mtot Am2      A/m    Am2/kg   Dec    Inc    q  Mag   (s: SI   or m3/kg)",
+        f"       Numero        Etape          Mtot Am2      {mag_label:<15s}Dec    Inc   q  Inst   {k_label}",
+        f"       Specimen      Step          Mtot Am2      {mag_label:<15s}Dec    Inc   q  Inst   {k_label}",
     )
 
     ij = 1
@@ -604,13 +649,13 @@ def list_measurements(
         for m in ech.mesures:
             xx, yy, zz = apply_orientation(m.x, m.y, m.z, ech, orientation)
             mtot, dec, inc = polere(xx, yy, zz)
-            am_par_m, am2_par_kg = _mag_values(ech, mtot)
+            intensity, _unit = normalized_intensity(ech, mtot)
             s_conv = _s_value(ech, m)
 
             out.write(
-                f"{ij:5d}: {ech.id:<12s}  {m.etape:4d}{m.cod1}{m.cod2}  "
-                f"{mtot:10.3E}  {_fmt_mag(am_par_m)}  {_fmt_mag(am2_par_kg)}  "
-                f"{dec:6.1f} {inc:6.1f}{m.q:4d}  {m.ins:<2s}  {s_conv:10.3E}  "
+                f"{ij:5d}: {ech.id:<12s}  {_fmt_step(m)}  "
+                f"{mtot:10.3E}  {intensity:10.3E}  "
+                f"{dec:6.1f} {inc:6.1f}{m.q:4d}  {m.ins:<4s}  {s_conv:10.3E}  "
                 f"{m.heuremes or '':<19s}\n"
             )
             ij += 1
@@ -625,11 +670,21 @@ def list_xyz(
     out: TextIO = sys.stdout,
 ) -> None:
     """Equivalent de `listeXYZ` : comme list_measurements, mais affiche les
-    composantes X,Y,Z du vecteur oriente au lieu de Dec/Inc (pas de polere)."""
+    composantes X,Y,Z du vecteur oriente au lieu de Dec/Inc (pas de polere).
+
+    Memes nettoyages que list_measurements (demande explicite utilisateur,
+    "the same treatment applied there too") : etape avec son unite,
+    susceptibilite relabelee "K" avec son unite suivant la normalisation
+    reellement utilisee, "Mag" -> "Inst". X/Y/Z n'ont pas la duplication
+    A/m + Am2/kg de list_measurements (une seule colonne normalisee par
+    composante) - leur unite commune est indiquee une fois, dans la ligne
+    de description au-dessus du tableau plutot que repetee 3 fois dans
+    l'en-tete de colonnes."""
+    mag_unit, k_label = _selection_norme_labels(selected)
     _write_report_header(
         out, idiom, orientation,
-        "       Numero      Etape      Mtot Am2          X          Y           Z         q  Mag   (s: SI   ou m3/kg)",
-        "       Sample       Step      Mtot Am2          X          Y           Z         q  Mag   (s: SI   or m3/kg)",
+        f"       Numero      Etape          Mtot Am2          X          Y           Z ({mag_unit})   q  Inst   {k_label}",
+        f"       Specimen      Step          Mtot Am2          X          Y           Z ({mag_unit})   q  Inst   {k_label}",
     )
 
     ij = 1
@@ -649,8 +704,8 @@ def list_xyz(
             s_conv = _s_value(ech, m)
 
             out.write(
-                f"{ij:5d}: {ech.id:<12s}  {m.etape:4d}{m.cod1}{m.cod2}  "
-                f"{xx:10.3E}  {rxx:10.3E}  {ryy:10.3E}  {rzz:10.3E}{m.q:4d}  {m.ins:<2s}  {s_conv:10.3E}\n"
+                f"{ij:5d}: {ech.id:<12s}  {_fmt_step(m)}  "
+                f"{xx:10.3E}  {rxx:10.3E}  {ryy:10.3E}  {rzz:10.3E}{m.q:4d}  {m.ins:<4s}  {s_conv:10.3E}\n"
             )
             ij += 1
 
@@ -663,11 +718,14 @@ def list_measurements_vrm(
 ) -> None:
     """Equivalent de `lismesVRM` : comme list_measurements, avec une colonne
     d'heures ecoulees depuis la premiere mesure de l'echantillon (utile pour
-    les etudes de viscosite / VRM)."""
+    les etudes de viscosite / VRM). Memes nettoyages que list_measurements
+    (demande explicite utilisateur, "the same treatment applied there
+    too")."""
+    mag_label, k_label = _selection_norme_labels(selected)
     _write_report_header(
         out, idiom, orientation,
-        "       Numero      Etape    heures     Mtot Am2      A/m    Am2/kg   Dec    Inc    q  Mag   (s: SI   ou m3/kg)",
-        "       Sample       Step    hours      Mtot Am2      A/m    Am2/kg   Dec    Inc    q  Mag   (s: SI   or m3/kg)",
+        f"       Numero      Etape          heures     Mtot Am2      {mag_label:<15s}Dec    Inc   q  Inst   {k_label}",
+        f"       Specimen      Step          hours      Mtot Am2      {mag_label:<15s}Dec    Inc   q  Inst   {k_label}",
     )
 
     ij = 1
@@ -681,13 +739,13 @@ def list_measurements_vrm(
 
             xx, yy, zz = apply_orientation(m.x, m.y, m.z, ech, orientation)
             mtot, dec, inc = polere(xx, yy, zz)
-            am_par_m, am2_par_kg = _mag_values(ech, mtot)
+            intensity, _unit = normalized_intensity(ech, mtot)
             s_conv = _s_value(ech, m)
 
             out.write(
-                f"{ij:5d}: {ech.id:<12s}  {m.etape:4d}{m.cod1}{m.cod2}  {elapsed_h:9.4f}  "
-                f"{mtot:10.3E}  {_fmt_mag(am_par_m)}  {_fmt_mag(am2_par_kg)}  "
-                f"{dec:6.1f} {inc:6.1f}{m.q:4d}  {m.ins:<2s}  {s_conv:10.3E}  "
+                f"{ij:5d}: {ech.id:<12s}  {_fmt_step(m)}  {elapsed_h:9.4f}  "
+                f"{mtot:10.3E}  {intensity:10.3E}  "
+                f"{dec:6.1f} {inc:6.1f}{m.q:4d}  {m.ins:<4s}  {s_conv:10.3E}  "
                 f"{m.heuremes or '':<19s}\n"
             )
             ij += 1
@@ -705,11 +763,14 @@ def list_measurements_depth(
     """Equivalent de `lismesdepth` : comme list_measurements, avec la
     profondeur de l'echantillon (depuis `depths`, {sample_id: depth} ; -999.0
     si absent) et l'angle par rapport a la direction attendue (D,I) au site,
-    calcule via `angle()` (equivalent de la subroutine `angle` de calcul.f)."""
+    calcule via `angle()` (equivalent de la subroutine `angle` de calcul.f).
+    Memes nettoyages que list_measurements (demande explicite utilisateur,
+    "the same treatment applied there too")."""
+    mag_label, k_label = _selection_norme_labels(selected)
     _write_report_header(
         out, idiom, orientation,
-        "  Prof     Numero      Etape      Mtot Am2      A/m    Am2/kg   Dec    Inc    q  Mag   (s: SI   ou m3/kg)  Angle",
-        "  depth      Sample       Step      Mtot Am2      A/m    Am2/kg   Dec    Inc    q  Mag   (s: SI   or m3/kg)  Angle",
+        f"  Prof     Numero      Etape          Mtot Am2      {mag_label:<15s}Dec    Inc   q  Inst   {k_label}  Angle",
+        f"  depth      Specimen      Step          Mtot Am2      {mag_label:<15s}Dec    Inc   q  Inst   {k_label}  Angle",
     )
 
     for ech in selected:
@@ -721,13 +782,13 @@ def list_measurements_depth(
             if dec > 270.0:
                 dec -= 360.0
 
-            am_par_m, am2_par_kg = _mag_values(ech, mtot)
+            intensity, _unit = normalized_intensity(ech, mtot)
             s_conv = _s_value(ech, m)
 
             out.write(
-                f"{depth:8.2f}   {ech.id:<12s}  {m.etape:4d}{m.cod1}{m.cod2}  "
-                f"{mtot:10.3E}  {_fmt_mag(am_par_m)}  {_fmt_mag(am2_par_kg)}  "
-                f"{dec:6.1f} {inc:6.1f}{m.q:4d}  {m.ins:<2s}  {s_conv:10.3E}  {delta:6.1f}\n"
+                f"{depth:8.2f}   {ech.id:<12s}  {_fmt_step(m)}  "
+                f"{mtot:10.3E}  {intensity:10.3E}  "
+                f"{dec:6.1f} {inc:6.1f}{m.q:4d}  {m.ins:<4s}  {s_conv:10.3E}  {delta:6.1f}\n"
             )
 
 
@@ -836,7 +897,8 @@ def sample_info(selected: List[SelectedSample]) -> str:
       compute_local_declination pour la valeur Fortran 0.0 qu'elle
       retourne dans ce cas - reinterpretee ici comme "non determine"
       plutot que comme une declinaison locale reellement nulle)."""
-    lines = [_info_row([label for label, _w, _a in _INFO_FIELDS])]
+    header_row = _info_row([label for label, _w, _a in _INFO_FIELDS])
+    lines = [f"{_HEADER_MARK}{header_row}{_HEADER_MARK}"]
     for i, ech in enumerate(selected, start=1):
         if ech.mesures:
             first, last = ech.mesures[0], ech.mesures[-1]
