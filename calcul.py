@@ -1021,16 +1021,35 @@ def _mean_line_plane_counts(r: FitResult, results: List[FitResult]) -> Optional[
     aucun des specimens references (ex: `results` == uniquement les
     moyennes, chargees avec carselect='m') - dans ce cas le compte est
     inconnu plutot que faussement 0/0."""
-    ids = [tok for tok in r.liste.replace("codes:", "").split(":") if tok.strip()]
-    if not ids:
-        return None
-    by_c = {str(other.c): other for other in results if other.id[:5] != "mean:"}
-    matched = [by_c[i] for i in ids if i in by_c]
+    matched = mean_components(r, results)
     if not matched:
         return None
     nlines = sum(1 for m in matched if m.cat1 == "L")
     nplanes = sum(1 for m in matched if m.cat1 == "P")
     return nlines, nplanes
+
+
+def mean_components(r: FitResult, results: List[FitResult]) -> List[FitResult]:
+    """Retourne les resultats specimen (parmi `results`) references dans
+    `r.liste` ("codes:c1:c2:...") - memes matching que
+    _mean_line_plane_counts, mais renvoie les FitResult eux-memes (pas
+    seulement un compte lignes/plans) - demande explicite utilisateur
+    ("when the results is a mean, can you plot the stereo with the mean
+    and individual results") : `data+interpretation` (afficher_visres,
+    app.py) ignorait jusqu'ici toute ligne "mean:" (comme le Fortran
+    d'origine), meme quand ses composants individuels etaient bien
+    charges a cote (mode "s" de Select results..., voir
+    _load_site_results) - desormais utilise pour tracer moyenne + ses
+    composants ensemble sur un seul stereo (build_stereo_results_figure
+    accepte deja une liste melant moyenne(s) et resultats individuels,
+    voir "Stereo Results"). Liste vide si `r.liste` ne reference rien de
+    present dans `results` (ex. `results` ne contient que des moyennes,
+    carselect='m')."""
+    ids = [tok for tok in r.liste.replace("codes:", "").split(":") if tok.strip()]
+    if not ids:
+        return []
+    by_c = {str(other.c): other for other in results if other.id[:5] != "mean:"}
+    return [by_c[i] for i in ids if i in by_c]
 
 
 def _mean_site_strike_dip(r: FitResult, donnees) -> Optional[Tuple[float, float]]:

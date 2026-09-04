@@ -74,6 +74,7 @@ from calcul import (
     compute_anicor_factor,
     _ANI_CODE2,
     _correct_dec_inc,
+    mean_components,
 )
 from zijderveld import build_zijderveld_figure, draw_zijderveld, build_zijderveld_stereo_results_figure
 from stereo import build_stereo_figure, build_stereo_results_figure
@@ -2514,10 +2515,14 @@ class StarmacApp:
         autres ajustements du même échantillon ne sont PAS superposés,
         comme le Fortran qui réduit `tr` à un seul élément avant d'appeler
         `zijder`) ; pour cat1 in ('P','f') affiche Stereo Results pour ce
-        seul résultat. Les résultats 'F' (moyennes) sont ignorés, comme
-        dans le Fortran (aucune des 3 branches if ne les traite). Même
-        motif pause/décision (Entrée = suivant, Échap = arrêter) que les
-        autres boucles (ajuslig, Arai...).
+        seul résultat. Pour cat1=='F' (moyenne de site) - IGNORÉ par le
+        Fortran d'origine, désormais traité - affiche un Stereo Results
+        combinant la moyenne (cône de confiance) ET ses composants
+        individuels (voir calcul.mean_components, cross-référencés via
+        `r.liste`) - demande explicite utilisateur ("when the results is
+        a mean, can you plot the stereo with the mean and individual
+        results"). Même motif pause/décision (Entrée = suivant, Échap =
+        arrêter) que les autres boucles (ajuslig, Arai...).
 
         Comme le Fortran (qui reconstruit l'échantillon DIRECTEMENT depuis
         `pmag(:)`, la totalité des données chargées, avec etapmin=0/
@@ -2545,8 +2550,42 @@ class StarmacApp:
         self.text_area.insert(tk.END, "\n--- Data + interpretation (Escape to stop) ---\n", "prompt")
         traite = 0
         for r in self.results:
-            if r.cat1 not in ("L", "P", "f"):
+            if r.cat1 not in ("L", "P", "f", "F"):
                 continue
+
+            if r.cat1 == "F":
+                # Moyenne de site : plus de specimen unique a chercher dans
+                # self.donnees (r.id = "mean: <site>", pas un id specimen) -
+                # trace la moyenne (cone de confiance) ET ses composants
+                # individuels ensemble sur un seul stereo, plutot que de
+                # l'ignorer comme le faisait le Fortran d'origine - demande
+                # explicite utilisateur ("when the results is a mean, can
+                # you plot the stereo with the mean and individual
+                # results"). build_stereo_results_figure accepte deja une
+                # liste melant moyenne(s) et resultats individuels (voir
+                # "Stereo Results") ; mean_components() retrouve les
+                # composants presents dans self.results via r.liste (les
+                # `c` combines) - vide si self.results ne contient que des
+                # moyennes (ex. charge avec carselect='m'), auquel cas la
+                # moyenne seule est quand meme tracee.
+                components = mean_components(r, self.results)
+                traite += 1
+                self._clear_figure()
+                self.fig.set_size_inches(5.5, 5.5, forward=True)
+                build_stereo_results_figure(
+                    [r] + components, orientation=self.orientation.get(),
+                    nbech=len(components) or None, fig=self.fig)
+                self._fit_figure_to_data()
+                self._redraw_canvas()
+
+                dec, inc = _correct_dec_inc(r, self.orientation.get())
+                n_txt = f", {len(components)} individual result(s)" if components else ""
+                self._afficher(f"{r.id}: dec={dec:.1f}  inc={inc:.1f}{n_txt}\n")
+                decision = self._console_input("Next (Enter) / stop (Escape): ", "")
+                if decision is None:
+                    return
+                continue
+
             matches = select_samples(
                 self.donnees, r.id, step_min=0, step_max=2000, demag1="*", demag2="*", verbose=False)
             ech = matches[0] if matches else None
@@ -2599,8 +2638,8 @@ class StarmacApp:
         if traite == 0:
             self._showinfo(
                 "No displayable result",
-                "No line/plane type result (« mean: » averages are not "
-                "displayed by « data+interpretation », matching the Fortran).",
+                "No line/plane/mean type result found (or the referenced "
+                "specimens are not loaded in self.donnees).",
             )
 
     def ouvrir_convertthelli_dialog(self):
