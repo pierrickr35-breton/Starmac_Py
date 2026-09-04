@@ -3079,6 +3079,39 @@ class StarmacApp:
             return code[0], "*"
         return code[0], code[1]
 
+    def _read_step_range(self, demag1, default_min="0", default_max="9999"):
+        """Demande Step min/Step max, avec un libelle et une conversion
+        d'unite adaptes a `demag1` (deja connu - l'appelant doit demander
+        le code demag AVANT d'appeler cette methode, pas apres comme
+        c'etait le cas ici auparavant) : mT pour un pas AF (A/F, converti
+        en interne vers l'echelle Oersted-equivalent - mT*10 - de
+        Measurement.etape), degC pour un pas thermique (D/S/T/K), step
+        brut sinon (code inconnu ou '*', ambigu - une selection melant
+        AF et thermique ne peut de toute facon pas partager une seule
+        conversion correcte, laisse donc inchange comme avant) - demande
+        explicite utilisateur ("remove the historical background in
+        oersted and now work only the AF in mT... accepter mT
+        directement... l'utilisateur tape 15 pour 15 mT, comme
+        l'affichage"). Retourne (step_min, step_max) ou None si annule/
+        invalide (message d'erreur deja affiche dans ce cas)."""
+        is_af = demag1 in ("A", "F")
+        is_thermal = demag1 in ("D", "S", "T", "K")
+        unit_label = "mT" if is_af else ("degC" if is_thermal else "step")
+        step_min_s = self._console_input(f"Step min ({unit_label}): ", default_min)
+        if step_min_s is None:
+            return None
+        step_max_s = self._console_input(f"Step max ({unit_label}): ", default_max)
+        if step_max_s is None:
+            return None
+        try:
+            step_min_val = float(step_min_s or default_min)
+            step_max_val = float(step_max_s or default_max)
+        except ValueError:
+            self._showerror("Error", "Step min / Step max must be numbers.")
+            return None
+        scale = 10.0 if is_af else 1.0
+        return int(round(step_min_val * scale)), int(round(step_max_val * scale))
+
     def _console_input(self, prompt, default=""):
         """Lit une ligne tapee au clavier DANS la fenetre texte, comme une
         vraie console (equivalent du `write(*,...)` + `read(*,*)` du Fortran
@@ -3167,23 +3200,14 @@ class StarmacApp:
         pattern = self._read_prefixed_pattern("Sample number (* = all, ? = wildcard): ")
         if pattern is None:
             return
-        step_min_s = self._console_input("Step min: ", "0")
-        if step_min_s is None:
-            return
-        step_max_s = self._console_input("Step max: ", "9999")
-        if step_max_s is None:
-            return
         demag_s = self._console_input("Demag code (e.g. N0, T, AF, * = all): ", "*")
         if demag_s is None:
             return
-        try:
-            step_min = int(step_min_s or 0)
-            step_max = int(step_max_s or 9999)
-        except ValueError:
-            self._showerror("Error", "Step min / Step max must be integers.")
-            return
-
         demag1, demag2 = self._parse_demag(demag_s)
+        step_range = self._read_step_range(demag1)
+        if step_range is None:
+            return
+        step_min, step_max = step_range
         new_matches = select_samples(
             self.donnees,
             pattern=pattern or "*",
@@ -3272,23 +3296,14 @@ class StarmacApp:
         site = self._pick_from_list("Select site", sites)
         if site is None:
             return
-        step_min_s = self._console_input("Step min: ", "0")
-        if step_min_s is None:
-            return
-        step_max_s = self._console_input("Step max: ", "9999")
-        if step_max_s is None:
-            return
         demag_s = self._console_input("Demag code (e.g. N0, T, AF, * = all): ", "*")
         if demag_s is None:
             return
-        try:
-            step_min = int(step_min_s or 0)
-            step_max = int(step_max_s or 9999)
-        except ValueError:
-            self._showerror("Error", "Step min / Step max must be integers.")
-            return
-
         demag1, demag2 = self._parse_demag(demag_s)
+        step_range = self._read_step_range(demag1)
+        if step_range is None:
+            return
+        step_min, step_max = step_range
         new_matches = select_samples_by_site(
             self.donnees, site=site or "*", step_min=step_min, step_max=step_max,
             demag1=demag1, demag2=demag2, verbose=False,
@@ -3344,27 +3359,19 @@ class StarmacApp:
         pattern = self._console_input("Sample to erase (* = all): ", "*")
         if pattern is None:
             return
-        step_min_s = self._console_input("Step min: ", "0")
-        if step_min_s is None:
-            return
-        step_max_s = self._console_input("Step max: ", "9000")
-        if step_max_s is None:
-            return
         demag_s = self._console_input("Demag code (* = all): ", "*")
         if demag_s is None:
             return
+        demag1, demag2 = self._parse_demag(demag_s)
+        step_range = self._read_step_range(demag1, default_max="9000")
+        if step_range is None:
+            return
+        step_min, step_max = step_range
         occurrence = self._console_input(
             "Occurrence to delete (* = all matches, 1 = first only, 2 = second only...): ", "*")
         if occurrence is None:
             return
-        try:
-            step_min = int(step_min_s or 0)
-            step_max = int(step_max_s or 9000)
-        except ValueError:
-            self._showerror("Error", "Step min / Step max must be integers.")
-            return
 
-        demag1, demag2 = self._parse_demag(demag_s)
         self.selection = delete_measurements(
             self.selection,
             pattern=pattern or "*",
