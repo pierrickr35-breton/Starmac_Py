@@ -283,6 +283,14 @@ class StarmacApp:
         self.canvas_fig = FigureCanvasTkAgg(self.fig, master=self.graph_frame)
         self.canvas_fig.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.paned_window.add(self.graph_frame, weight=1)
+        # Clic-pour-info sur un point de graphique (Zijderveld/Stereo
+        # Results) - demande explicite utilisateur ("un collegue m'a
+        # demande si il etait possible de cliquer sur des donnees d'un
+        # graphique pour obtenir des informations") - UN SEUL point de
+        # connexion pour tous les graphiques (self.fig/self.canvas_fig
+        # sont partages, voir PlotContext.pick_point pour comment chaque
+        # point interactif est enregistre a la construction du graphique).
+        self.canvas_fig.mpl_connect("pick_event", self._on_plot_pick)
 
         # PANNEAU DROIT : Console / Liste de données
         self.text_frame = ttk.Frame(self.paned_window, width=550)
@@ -707,6 +715,35 @@ class StarmacApp:
 
         self._fit_figure_to_data()
         self._redraw_canvas()
+
+    def _on_plot_pick(self, event):
+        """Gestionnaire unique de clic-sur-point (pick_event), pour tous
+        les graphiques - demande explicite utilisateur ("un collegue m'a
+        demande si il etait possible de cliquer sur des donnees d'un
+        graphique pour obtenir des informations, par exemple sur un
+        zijderveld, la temperature, ou sur un stereo results, le nom du
+        specimen"). Chaque point interactif est enregistre a la
+        construction du graphique via PlotContext.pick_point (zijderveld.
+        draw_zijderveld / stereo.draw_stereo_results), qui attache
+        `_starmac_pick_kind`/`_starmac_pick_data` a un scatter invisible -
+        ce gestionnaire n'a qu'a les relire, sans redecoder les
+        coordonnees affichees. `event.ind[0]` : index du point le plus
+        proche du clic parmi ceux de CET artiste (un artiste par point
+        ici, donc toujours 0, mais reste correct si un futur point
+        interactif regroupait plusieurs positions dans un seul scatter)."""
+        artist = event.artist
+        kind = getattr(artist, "_starmac_pick_kind", None)
+        data = getattr(artist, "_starmac_pick_data", None)
+        if kind is None or not event.ind:
+            return
+        idx = event.ind[0]
+        item = data[idx] if isinstance(data, (list, tuple)) else data
+
+        if kind == "zijderveld_step":
+            m = item
+            self._afficher(f"[Zijderveld] step {m.etape}{m.cod1}{m.cod2}\n")
+        elif kind == "stereo_specimen":
+            self._afficher(f"[Stereo Results] {item}\n")
 
     def _redraw_canvas(self):
         """Agrandit le CONTENANT (volet gauche du PanedWindow + fenetre)

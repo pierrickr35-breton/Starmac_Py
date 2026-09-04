@@ -183,6 +183,28 @@ class PlotContext:
             self.plot(x_cm, y_cm, 2)
         self._label2(x_cm, y_cm, h_cm, ityp)
 
+    def pick_point(self, x_cm: float, y_cm: float, kind: str, data) -> None:
+        """Enregistre un point interactif INVISIBLE (scatter alpha=0,
+        picker actif) a la meme position qu'un `symbol()`/`plot()` deja
+        trace (memes origine/rotation courantes via `_transform`) - pour
+        le clic-pour-info cote app.py (`pick_event`), sans jamais changer
+        le rendu visible - demande explicite utilisateur ("un collegue
+        m'a demande si il etait possible de cliquer sur des donnees d'un
+        graphique pour obtenir des informations, par exemple sur un
+        zijderveld la temperature, ou sur un stereo results le nom du
+        specimen"). N'affecte JAMAIS l'export SVG : svgwriter.py est un
+        pipeline de rendu totalement independant (ecrit du SVG brut,
+        n'importe pas ce module), see docstring de module ci-dessus.
+        `kind` identifie le type de point pour le gestionnaire de clic
+        (ex. "zijderveld_step", "stereo_specimen") ; `data` est
+        l'information a afficher (objet Measurement, id specimen...),
+        recuperee via `event.artist._starmac_pick_data` sans avoir a
+        redecoder les coordonnees affichees."""
+        tx, ty = self._transform(x_cm, y_cm)
+        artist = self.ax.scatter([tx], [ty], s=250, alpha=0, picker=True, zorder=1000)
+        artist._starmac_pick_kind = kind
+        artist._starmac_pick_data = data
+
     def _label2(self, x_cm: float, y_cm: float, size_cm: float, itype: int) -> None:
         r = size_cm / 2.0
         if itype in (1, 5):  # plus

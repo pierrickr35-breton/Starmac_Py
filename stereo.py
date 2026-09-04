@@ -380,14 +380,17 @@ def draw_stereo_results(
         ctx.newpen(1)
 
     # --- points de direction pour L/f (lignes 322-335) ---
-    line_dirs = [
-        _correct_dec_inc(res, orientation) for res in results if res.cat1 in ("L", "f")
-    ]
+    line_results = [res for res in results if res.cat1 in ("L", "f")]
+    line_dirs = [_correct_dec_inc(res, orientation) for res in line_results]
     if line_dirs:
         ctx.newpen(3)
-        for dec, inc in line_dirs:
+        for (dec, inc), res in zip(line_dirs, line_results):
             u, v, ifl = superc(la, phi, dec, inc, iproj)
             ctx.symbol(v * r, u * r, point_size, 8 if ifl == 5 else 14, -1)
+            # Point interactif invisible (clic-pour-info) - demande
+            # explicite utilisateur ("cliquer sur des donnees d'un
+            # graphique... sur un stereo results, le nom du specimen").
+            ctx.pick_point(v * r, u * r, "stereo_specimen", res.id)
         ctx.newpen(1)
 
     # --- grands cercles pour les plans P (lignes 337-390) : les newpen()

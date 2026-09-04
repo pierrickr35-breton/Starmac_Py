@@ -295,6 +295,16 @@ def draw_zijderveld(
             ctx.symbol(cm_scale * x_cm, cm_scale * y_cm, marker_size, 20, -1)
         ctx.newpen(1)
 
+    # Points interactifs invisibles (clic-pour-info) sur CHAQUE point trace,
+    # dans les DEUX projections - demande explicite utilisateur ("cliquer
+    # sur des donnees d'un graphique... par exemple sur un zijderveld, la
+    # temperature"). `data` = la Measurement elle-meme (etape/cod1/cod2),
+    # laisse la mise en forme au gestionnaire de clic cote app.py plutot
+    # que de figer un texte ici.
+    for x_cm, y_sec, y_vert, m in zip(screen_x, secondary_vals, vert_y, mesures_zij):
+        ctx.pick_point(cm_scale * x_cm, cm_scale * y_sec, "zijderveld_step", m)
+        ctx.pick_point(cm_scale * x_cm, cm_scale * y_vert, "zijderveld_step", m)
+
     # ajustements de droite : couleur par numero de composante (numcomp),
     # epaisseur doublee - port de `zijder2` (lignes ~2276-2300).
     _FIT_PENS = {1: 3, 2: 4, 3: 5, 4: 8}

@@ -173,6 +173,14 @@ class SVGWriter:
             self.plot(x_cm, y_cm, 2)
         self._label2(x_cm, y_cm, h_cm, ityp)
 
+    def pick_point(self, x_cm: float, y_cm: float, kind: str, data) -> None:
+        """No-op : equivalent SVG de PlotContext.pick_point (plotlib.py).
+        Un export SVG statique n'a pas d'interactivite clic-pour-info -
+        cette methode existe uniquement pour que draw_zijderveld/
+        draw_stereo_results (appelees indifferemment avec un PlotContext
+        ou un SVGWriter, voir app.py "Export SVG...") restent utilisables
+        sans verifier `hasattr` a chaque site d'appel."""
+
     def _label2(self, x_cm: float, y_cm: float, size_cm: float, itype: int) -> None:
         r = size_cm / 2.0
         if itype in (1, 5):  # plus
