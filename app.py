@@ -734,7 +734,18 @@ class StarmacApp:
         artist = event.artist
         kind = getattr(artist, "_starmac_pick_kind", None)
         data = getattr(artist, "_starmac_pick_data", None)
-        if kind is None or not event.ind:
+        # BUG REEL corrige ici (signale par l'utilisateur, "does not show
+        # anything on my macbook air") : `event.ind` est un tableau numpy
+        # (ex. array([0])) - `not event.ind` teste la VALEUR de son unique
+        # element (0 -> False) plutot que si le tableau est vide, contraire
+        # a l'intuition d'une liste Python. Comme chaque artiste
+        # interactif ne porte qu'UN SEUL point (voir PlotContext.
+        # pick_point), l'index trouve est TOUJOURS 0 - `not event.ind`
+        # valait donc TOUJOURS True, sortant de la fonction avant meme
+        # d'afficher quoi que ce soit, sur CHAQUE clic. Diagnostique via
+        # un test manuel de figure.pick()/artist.contains() (les deux
+        # reussissaient) montrant que seul ce garde-fou bloquait l'affichage.
+        if kind is None or len(event.ind) == 0:
             return
         idx = event.ind[0]
         item = data[idx] if isinstance(data, (list, tuple)) else data
