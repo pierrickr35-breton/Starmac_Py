@@ -1116,12 +1116,19 @@ def list_results(results: List[FitResult], orientation: int = 1, donnees=None) -
             strdip = _mean_site_strike_dip(r, donnees)
             strdip_txt = f"str={strdip[0]:5.1f} dip={strdip[1]:4.1f}" if strdip else "str=?  dip=?"
             own_tag = _ORIENT_MODE_TAG.get(int(r.par3_mean), "?")
+            # Ligne separee pour [codes:...] (demande explicite utilisateur,
+            # "when you list the results with a mean... a linefeed might be
+            # useful") : `r.liste` porte un `c` par specimen combine dans la
+            # moyenne, sans borne de longueur - accolee en fin de la ligne
+            # de statistiques deja longue, elle rendait certaines moyennes
+            # (site a beaucoup de specimens) illisibles sur une seule ligne
+            # sans retour a la ligne, la fenetre Text ayant wrap="none".
             lines.append(
                 f"{i:4d}: {r.id:<13s}[{r.component or 'A'}]{r.numcomp:4d}   {r.cat1}{r.cat2}    {r.orig}     {r.demag:<3s}"
                 f"  {lp_txt}  {r.nb:4d}  {dec:6.1f} {inc:6.1f} ({own_tag})  a95={r.mad:5.1f} e95={e95:5.1f}"
                 f"  k={r.tx[0]:8.1f}  lat={r.lat:9.5f} lon={r.rlong:9.5f}"
-                f"  VGP=({r.par4:6.1f},{r.par5:6.1f})  dp/dm=({dp_show:.1f}/{dm_show:.1f})  {strdip_txt}"
-                f"   [{r.liste}]"
+                f"  VGP=({r.par4:6.1f},{r.par5:6.1f})  dp/dm=({dp_show:.1f}/{dm_show:.1f})  {strdip_txt}\n"
+                f"          [{r.liste}]"
             )
         else:
             lines.append(
